@@ -1,7 +1,7 @@
 ---
 title: "Statistical Certification: Five Barriers Against Overfitting"
 sidebarTitle: "Certification"
-description: "Understand pump-anomaly's five-barrier statistical certificate (DSR, PBO, SPA, minTRL, nested OOS) that proves an edge is real before allowing live trading."
+description: "Learn how pump-anomaly certifies a real edge using DSR, PBO, SPA, minTRL, and nested OOS — five independent barriers against backtest overfitting."
 ---
 
 Grid search is `argmax` over thousands of CV scores. Even when the true edge is exactly zero, the maximum of N noisy estimates is biased upward by approximately `σ · √(2 · ln N)`. The one-standard-error rule (see [Training](/guides/training)) softens this, but it does not *prove* the surviving edge is real. The statistical certificate does. It is an independent judge applied to the already-selected configuration — it is never used as an input to selection, because using it to pick configs would make it overfittable and defeat the point.
@@ -88,10 +88,10 @@ This is the layer `reliable` cannot provide. `reliable: true` only means there w
 These two properties answer different questions and both are required:
 
 <CardGroup cols={2}>
-  <Card title="reliable: true" icon="database">
+  <Card title="reliable: true" icon="database" href="/guides/training">
     Data quality — enough trades, the edge was stable across folds, and it was statistically distinguishable from zero within the dataset. Tells you the training data was sound.
   </Card>
-  <Card title="certified: true" icon="shield-check">
+  <Card title="certified: true" icon="shield-check" href="/guides/certification">
     Edge reality — the selected configuration survives all five barriers against winner's curse. Tells you the edge is not a brute-force search artifact.
   </Card>
 </CardGroup>

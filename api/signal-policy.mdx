@@ -1,7 +1,7 @@
 ---
 title: "SignalPolicy: Baked-In Allow-List for Trade Actions"
 sidebarTitle: "SignalPolicy"
-description: "Configure which trade actions (enter, invert, tighten) are allowed at training time with SignalPolicy. Runtime policies can only narrow — never widen — the trained policy."
+description: "SignalPolicy governs which actions a PumpMatrix model may emit. It is baked in at training, serialized to model JSON, and can only be narrowed at runtime."
 ---
 
 `SignalPolicy` is the serializable allow-list that controls which signal actions `PumpMatrix` is permitted to emit. It is fixed at training time and baked into the model JSON — making it part of the model's contract, not a runtime configuration. In production, the second argument to `signals()`, `plan()`, and `backtest()` can only **narrow** the trained policy for a single call; it can never re-enable actions that training forbade.
@@ -17,16 +17,16 @@ This replaces the older runtime flags `disableInvert` / `disableSqueeze` with a 
 ## SignalPolicy Interface
 
 ```typescript
+type AllowAction = "enter" | "invert" | "tighten";
+
 interface SignalPolicy {
-  allow: SignalAction[];  // "enter" | "invert" | "tighten"
+  allow: AllowAction[];
   minRiskReward?: number;
   rrMetric?: "mean" | "p95" | "p99";
 }
-
-type SignalAction = "enter" | "invert" | "tighten";
 ```
 
-<ResponseField name="allow" type="SignalAction[]" required>
+<ResponseField name="allow" type="AllowAction[]" required>
   The list of permitted signal actions. Only actions present in this array will ever be returned by `signals()`, `plan()`, or `backtest()`. Signals whose computed action is not in the allow-list are silently dropped — they never appear in the output.
 
   - `"enter"` — standard directional entry
@@ -115,7 +115,7 @@ This replaced the old `disableInvert: boolean` flag with a single, serialized, i
 
 ## Risk-Reward Filter
 
-`minRiskReward` and `rrMetric` are purely runtime — they are not baked into the model at training time, because the RR statistics (`model.riskReward.bySymbol`) are already part of the trained params. The runtime policy can only **tighten** an existing `minRiskReward` (raise the threshold), never lower it.
+`minRiskReward` and `rrMetric` can be included in `opts.policy` at training time (and will be serialized), but by convention they are treated as runtime-only filters — `DEFAULT_POLICY` carries neither, and the underlying RR statistics already live in `model.riskReward.bySymbol`. The runtime policy can only **tighten** an existing `minRiskReward` (raise the threshold via `max(trained, requested)`), never lower it.
 
 ```typescript
 // Filter: only symbols with mean RR >= 1.5

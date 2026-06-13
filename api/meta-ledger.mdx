@@ -48,6 +48,27 @@ interface MetaLedgerState {
 
 ---
 
+## `MetaPolicy` and `DEFAULT_META_POLICY`
+
+`MetaPolicy` is the cadence-policy interface consumed by `canRefit`. Both the interface and the default constant are exported from the package.
+
+```typescript
+interface MetaPolicy {
+  /** Minimum interval between fits (ms). Default: 7 days. */
+  minRefitMs: number;
+}
+
+const DEFAULT_META_POLICY: MetaPolicy = {
+  minRefitMs: 7 * 24 * 3600_000, // one week
+};
+```
+
+<ResponseField name="minRefitMs" type="number">
+  Minimum milliseconds that must elapse between consecutive `fit()` calls. The default of `604_800_000` (7 days) ensures each refit incorporates at least one week of new market data rather than re-drawing on the same history.
+</ResponseField>
+
+---
+
 ## `emptyLedger`
 
 ```typescript
@@ -75,7 +96,7 @@ let ledger = emptyLedger();
 canRefit(
   ledger: MetaLedgerState,
   now: number,
-  policy?: { minRefitMs: number },
+  policy?: MetaPolicy,
 ): { allowed: boolean; reason: string; nextAllowedTs: number }
 ```
 
@@ -88,6 +109,9 @@ The default `minRefitMs` is **7 days** (`7 × 24 × 3600 × 1000 ms`). This refl
 </ParamField>
 <ParamField path="now" type="number" required>
   Current Unix timestamp in milliseconds. Pass `Date.now()` in production.
+</ParamField>
+<ParamField path="policy" type="MetaPolicy">
+  Cadence policy. Omit to use `DEFAULT_META_POLICY` (7-day minimum interval). Pass a custom `MetaPolicy` to override `minRefitMs`.
 </ParamField>
 <ParamField path="policy.minRefitMs" type="number">
   Minimum milliseconds between fits. Default: `604_800_000` (7 days).

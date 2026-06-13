@@ -1,7 +1,7 @@
 ---
-title: "Per-Asset Training Grids for 15 Cryptocurrencies"
+title: "Per-Asset Training Grids for 15 Supported Cryptocurrencies"
 sidebarTitle: "Per-Asset Grids"
-description: "Pre-tuned TrainGrid configurations for BTC, ETH, SOL, DOGE, BNB, XRP, and more — covering pump speed, stop tightness, cascade detection, and matrix strictness."
+description: "Pre-tuned TrainGrid configs for BTC, ETH, SOL, DOGE, BNB, XRP, and more — covering pump speed, stop tightness, cascade detection, and matrix strictness."
 ---
 
 `DEFAULT_GRID` in `src/train.ts` is deliberately asset-agnostic — a small, balanced search space that works for any coin. The per-asset grids in the `config/` folder specialize the search space to **how each coin actually pumps**. They do not bypass the statistical gates: `fit` still runs time-series K-fold, 1-SE selection, and certification within whatever ranges the grid defines. What they do is make the search look in the right place, rather than spending compute on horizons or stop widths that never win for a given asset.
@@ -140,10 +140,10 @@ const model = await PumpMatrix.fit(history, getCandles, {
 ## Memecoins vs Majors
 
 <CardGroup cols={2}>
-  <Card title="Memecoins (Fartcoin, HYPE, SOL)" icon="bolt">
+  <Card title="Memecoins (Fartcoin, HYPE, SOL)" icon="bolt" href="/guides/per-asset-grids">
     **Short `staleMinutes`** (25m–8h), **tight `hardStop`** (0.65–2.5%), **short `cascadeWindowMinutes`** (8–40m), **short `stationarityWindowMs`** (days), **loose matrix** (low `jaccardThreshold`/`lagPeakThreshold` to catch bursts through noise), **`invert` kept** (liquidation-cascade reversals are frequent and profitable), **high `shrinkageK`** (7–8, fat outlier protection), refit every 3–7 days.
   </Card>
-  <Card title="Majors (BTC, ETH, XRP, LTC, XLM, LINK, DOT)" icon="building-columns">
+  <Card title="Majors (BTC, ETH, XRP, LTC, XLM, LINK, DOT)" icon="building-columns" href="/guides/per-asset-grids">
     **Long `staleMinutes`** (2h–48h+), **wide `hardStop`** (1.2–5.0%), **long `cascadeWindowMinutes`** (20–300m), **long `stationarityWindowMs`** (weeks–months), **strict matrix** (high thresholds, `minSharedEvents` 4–5, `minStrongEdges` 2), **`invert` dropped** (`["none","tighten","veto"]` only), **lower `shrinkageK`** (5–6), refit every 2–8 weeks.
   </Card>
 </CardGroup>

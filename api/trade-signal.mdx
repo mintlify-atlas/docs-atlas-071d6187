@@ -1,7 +1,7 @@
 ---
-title: "TradeSignal and BacktestSignal Type Reference"
+title: "TradeSignal and BacktestSignal: Output Type Reference"
 sidebarTitle: "TradeSignal"
-description: "Complete field reference for TradeSignal, BacktestSignal, BacktestResult, ExitPlan, and SignalOrigin — the output types of plan(), signals(), and backtest()."
+description: "Field-level reference for TradeSignal, BacktestSignal, BacktestResult, ExitPlan, and SignalOrigin — output types of signals(), plan(), and backtest()."
 ---
 
 Every execution method in `PumpMatrix` produces a `TradeSignal` — a single, flat, immediately actionable object. The design principle is that production code reads the flat executable fields (`symbol`, `direction`, `exit`) and calls `openPosition` without branching. Provenance, audit information, and detector metadata live in the nested `origin` object, which is for logging and tracing, not for conditional logic.
@@ -222,7 +222,9 @@ interface BacktestResult {
   - `"trailing-take"` — pullback from peak exceeded `trailingTake`
   - `"peak-staleness"` — position went stale after peak profit threshold was reached
   - `"life-cap"` — impact horizon expired
-  - `"no-candles"` — no candle data was available (entered is false)
+  - `"cascade-veto"` — the cascade detector fired `squeezePolicy: "veto"` and the entry was blocked (`entered: false`)
+  - `"no-entry"` — no candle in the window touched the entry zone (`entered: false`)
+  - `"no-candles"` — no candle data was available at all (`entered: false`)
 </ResponseField>
 
 <ResponseField name="heldMinutes" type="number" required>

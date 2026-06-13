@@ -1,7 +1,7 @@
 ---
 title: "PumpMatrix Class: Train, Load, and Execute Signals"
 sidebarTitle: "PumpMatrix"
-description: "Complete API reference for the PumpMatrix class — fit(), load(), save(), signals(), plan(), backtest(), planFor(), planForAt(), explain(), dump(), and all model properties."
+description: "PumpMatrix API: fit() trains the model, load() restores it, signals() and plan() drive live trades, backtest() replays history, getters expose diagnostics."
 ---
 
 `PumpMatrix` is the main facade of the `pump-anomaly` library. It wraps the full training pipeline, the exit tensor, the liquidation-cascade detector, and the serialized allow-list policy into a single stable class. After training once with `PumpMatrix.fit()`, you call `model.save()` to persist the weights, then `PumpMatrix.load()` in production to restore the model without retraining. Execution methods — `signals()`, `plan()`, `backtest()`, `planFor()`, and `planForAt()` — return only actionable `TradeSignal` objects; veto decisions are filtered out internally before the result is returned.

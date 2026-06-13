@@ -1,7 +1,7 @@
 ---
 title: "Detector Layer Architecture: From Raw Events to Signals"
 sidebarTitle: "Detector Layers"
-description: "Deep dive into pump-anomaly's five internal processing layers: lag self-tuning, Jaccard screening, lag cross-correlation, author clustering, and burst early warning."
+description: "Deep dive into pump-anomaly's five pipeline layers: lag self-tuning, Jaccard screening, lag cross-correlation, author clustering, and burst early warning."
 ---
 
 The matrix-mode pipeline is a five-stage funnel. Raw `ParserItem` events enter the top; by the bottom, only synchronous bursts from genuinely independent author clusters survive and become `action: "open"` signals. Each stage has a single, well-defined job. None of them contain magic thresholds baked into logic — every parameter is a grid axis exposed for training.

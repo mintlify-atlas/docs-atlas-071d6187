@@ -93,16 +93,16 @@ Override the viability thresholds by passing `viability` to `fit` or `predict`. 
 The training label comes from an **exact replay of your production exit on 1m candles** (`replayExit`), not close-to-close. This is the most important property of the library: the optimizer sees the actual path the price took, not just two endpoints.
 
 <CardGroup cols={2}>
-  <Card title="moonbag / gravebag" icon="triangle-exclamation">
+  <Card title="moonbag / gravebag" icon="triangle-exclamation" href="/concepts/liquidation-cascade">
     For a long (`moonbag`), the hard stop fires when the low of a 1m candle drops `hardStop %` below entry. For a short (`gravebag`), it fires when the high rises `hardStop %` above entry. Both are honest realized losses.
   </Card>
-  <Card title="Trailing take" icon="chart-line">
+  <Card title="Trailing take" icon="chart-line" href="/concepts/exit-tensor">
     Once `currentProfit >= 0`, the peak is tracked. When the close pulls back `trailingTake %` from the peak, the position exits at the peak PnL — not at the pullback close.
   </Card>
-  <Card title="Peak staleness" icon="clock">
+  <Card title="Peak staleness" icon="clock" href="/concepts/exit-tensor">
     If the peak exceeds `stalenessSinceProfit %` profit but no new high is made for `stalenessSinceMinutes` minutes, the position exits at the stale peak. The price may never reach a classic TP target at all.
   </Card>
-  <Card title="Life-cap" icon="stopwatch">
+  <Card title="Life-cap" icon="stopwatch" href="/concepts/exit-tensor">
     `staleMinutes` is the ceiling on position lifetime — the empirical impact horizon tuned by the grid. The position exits at the close of the last candle in the window, realizing whatever PnL (positive or negative) is there.
   </Card>
 </CardGroup>

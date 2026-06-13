@@ -1,7 +1,7 @@
 ---
-title: "Meta-Ledger: Prevent Overfitting Across Repeated Training Runs"
+title: "Meta-Ledger: Guard Against Overfitting Across Repeated Fits"
 sidebarTitle: "Meta-Ledger"
-description: "Use MetaLedger to guard against meta-winner's-curse when running PumpMatrix.fit() repeatedly in a rolling retraining loop."
+description: "Use MetaLedger to prevent meta-level winner's-curse: enforce a refit cadence and apply a family-wise DSR correction across all PumpMatrix.fit() attempts."
 ---
 
 The statistical certificate (`certified: true`) guards against overfitting **within** a single `fit()` call — DSR penalizes the N configurations searched in that run. But consider a rolling retraining loop that calls `fit()` 720 times over a month (once per hour) and promotes the model to live trading only when `certified: true`. That is itself a search over 720 trials. A single-fit certificate is blind to this chain: each "certified" run can be the lucky outlier among all 720 attempts, and the loop has no way to know. `meta-ledger.ts` closes this gap in code, not with operator discipline.
@@ -11,10 +11,10 @@ The statistical certificate (`certified: true`) guards against overfitting **wit
 ## Two Guards
 
 <CardGroup cols={2}>
-  <Card title="Cadence Guard" icon="clock">
+  <Card title="Cadence Guard" icon="clock" href="/guides/meta-ledger">
     `canRefit(ledger, now)` refuses a `fit()` call that comes too soon after the last one. Frequent refit multiplies trials at the meta level; disallowing it prevents the multiplication before it starts.
   </Card>
-  <Card title="Family-Wise DSR Correction" icon="calculator">
+  <Card title="Family-Wise DSR Correction" icon="calculator" href="/guides/meta-ledger">
     When `metaLedger` is passed to `fit()`, DSR's trial count becomes `effectiveTrials = Σ configs across ALL past attempts`, not just the current grid. The denominator is honest only because every attempt — successful or not — is logged.
   </Card>
 </CardGroup>
@@ -34,13 +34,13 @@ const gate = canRefit(ledger, Date.now());
 
 if (!gate.allowed) {
   console.log(gate.reason);
-  // "too-frequent refit: 156.4h until next allowed.
-  //  Frequent refit multiplies trials (meta-winner's-curse)."
+  // "слишком частый refit: до следующего разрешённого 156.4ч.
+  //  Частое переобучение размножает испытания (мета-winner's-curse)."
   console.log(new Date(gate.nextAllowedTs).toISOString());
 }
 ```
 
-The first call on an empty ledger is always allowed (`reason: "first fit"`). Subsequent calls are allowed only after `minRefitMs` has elapsed since the last logged attempt.
+The first call on an empty ledger is always allowed (`reason: "первый fit"`). Subsequent calls are allowed only after `minRefitMs` has elapsed since the last logged attempt.
 
 Override the minimum interval via the optional `policy` argument:
 

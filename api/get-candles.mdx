@@ -1,7 +1,7 @@
 ---
-title: "GetCandles: OHLCV Candle Data Provider Interface"
+title: "GetCandles: pump-anomaly Candle Data Provider Interface"
 sidebarTitle: "GetCandles"
-description: "Reference for the GetCandles async function type — how to implement the candle data adapter that pump-anomaly uses for training, live trading, and backtesting."
+description: "Reference for the GetCandles async type — implement the candle data adapter that pump-anomaly uses for training, live signals, and backtesting."
 ---
 
 `GetCandles` is the single data-layer interface `PumpMatrix` requires. Implement it once and use it for all three phases: `fit()`, `plan()`, and `backtest()`. The same adapter signature is compatible with [`backtest-kit`](https://www.npmjs.com/package/backtest-kit)'s `Exchange.getRawCandles` — the argument order matches one-to-one, so the adapter is a thin pass-through if you already use that library.

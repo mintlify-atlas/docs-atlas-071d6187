@@ -1,7 +1,7 @@
 ---
 title: "Exit Tensor: Per-Source Per-Asset Trained Exit Parameters"
 sidebarTitle: "Exit Tensor"
-description: "Understand how pump-anomaly trains and resolves exit parameters (trailing take, hard stop, impact horizon) per channel, symbol, direction, and volume regime."
+description: "How pump-anomaly trains and resolves exit parameters (trailing take, hard stop, impact horizon) per channel, symbol, direction, and volume regime."
 ---
 
 `pump-anomaly` does not copy the stop-loss and targets from the Telegram post. Instead it trains its own exit parameters — trailing take, hard stop, and impact horizon — using an exact path-aware replay of your production exit on 1m candles. These parameters are stored in a five-dimensional exit tensor that is resolved hierarchically at inference time.

@@ -1,6 +1,6 @@
 ---
 title: "Integrate pump-anomaly with backtest-kit and ccxt"
-sidebarTitle: "backtest-kit"
+sidebarTitle: "Backtest Kit"
 description: "Wire pump-anomaly's GetCandles interface to backtest-kit's Exchange.getRawCandles via a thin adapter, using ccxt as the exchange backend."
 ---
 
@@ -11,7 +11,7 @@ description: "Wire pump-anomaly's GetCandles interface to backtest-kit's Exchang
 The complete integration from the README — register the exchange schema once, then reuse the same `getCandles` adapter everywhere:
 
 ```typescript
-import { addExchangeSchema, Exchange } from "backtest-kit";
+import { addExchangeSchema, Exchange, roundTicks } from "backtest-kit";
 import { singleshot } from "functools-kit";
 import * as pump from "pump-anomaly";
 import ccxt from "ccxt";

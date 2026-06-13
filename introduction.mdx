@@ -1,7 +1,7 @@
 ---
 title: "Pump Anomaly: Synchronized Crypto Pump Signal Detector"
 sidebarTitle: "Introduction"
-description: "Pump Anomaly is a TypeScript SDK for detecting multi-author synchronized pump signals in crypto, with path-aware exit replay and liquidation-cascade detection."
+description: "TypeScript SDK for detecting multi-author synchronized pump signals in crypto, with path-aware exit replay and liquidation-cascade detection."
 ---
 
 `pump-anomaly` is a TypeScript library for detecting **synchronized pump signals** in a stream of trading recommendations from Telegram channels and turning that detection into a ready-to-execute trade plan. It ingests a stream of `ParserItem[]` objects — one per channel post — runs a five-layer author-cluster pipeline to separate real coordinated capital inflow from single-actor channel manipulation, simulates your production exit on 1-minute OHLCV candles to produce honest training labels, and returns a flat `TradeSignal` array where direction, entry zone, and exit parameters are already resolved. Your application just executes — no conditional logic about veto, inversion, or mode is needed in prod code.

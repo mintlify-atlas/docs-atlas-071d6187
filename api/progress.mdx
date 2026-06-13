@@ -1,5 +1,5 @@
 ---
-title: "Training Progress Callbacks: stdoutProgress and silentProgress"
+title: "Training Progress: stdoutProgress and silentProgress"
 sidebarTitle: "Progress"
 description: "Reference for pump-anomaly's training progress API — ProgressFn, ProgressEvent, stdoutProgress (default bar), and silentProgress (no-op)."
 ---
@@ -14,12 +14,12 @@ Every tick from the training pipeline delivers a `ProgressEvent` to the register
 
 ```typescript
 interface ProgressEvent {
-  /** Which training phase is currently running */
-  phase: "label" | "score" | "nested";
   /** Number of units completed in this phase */
   done: number;
   /** Total units in this phase */
   total: number;
+  /** Which training phase is currently running */
+  phase: "label" | "score" | "nested";
   /** Current item being processed — symbol during labeling, grid key during scoring */
   label: string;
 }
@@ -46,7 +46,7 @@ interface ProgressEvent {
 ## `ProgressFn`
 
 ```typescript
-type ProgressFn = (event: ProgressEvent) => void;
+type ProgressFn = (e: ProgressEvent) => void;
 ```
 
 A synchronous callback that receives one `ProgressEvent` per unit of work. The callback is called from inside the `fit()` / `train()` async loop; it should return quickly and must not throw.

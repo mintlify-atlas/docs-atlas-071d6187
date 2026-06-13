@@ -1,7 +1,7 @@
 ---
-title: "Liquidation Cascade Detection: Symmetric Long/Short Stop Hunting"
+title: "Liquidation Cascade: Symmetric Long/Short Stop Hunting"
 sidebarTitle: "Liquidation Cascade"
-description: "How pump-anomaly detects stop-hunting traps using volume z-scores and squeeze pressure, and the four cascade policy reactions: none, tighten, veto, invert."
+description: "Detect stop-hunting traps with volume z-scores and squeeze pressure. Covers five cascade policy reactions: none, tighten, veto, invert, and ignore."
 ---
 
 Stop hunting is a deliberate price manipulation where large players push the market just far enough to trigger a wall of leveraged stop orders. The crowd, entering on a Telegram signal, becomes the fuel. `pump-anomaly` detects this trap using two volume-based metrics and reacts according to a trained policy — tightening the exit, vetoing entry entirely, or even inverting the trade direction to capture the cascade itself.
@@ -76,19 +76,19 @@ model.lookbackMinutes; // keep at least this much history available in prod
 
 ## Policy Reactions
 
-When `volZ >= volZThreshold` AND `squeezePressure >= squeezeThreshold`, the cascade policy fires. `squeezePolicy` is a grid axis — training picks the best reaction per cell of the exit tensor.
+When `squeezePressure >= squeezeThreshold`, the cascade policy fires. `volZ` and `volZThreshold` are used only to determine `volRegime` (`calm` vs `anomalous`) for exit-tensor cell resolution — they do not gate the policy. `squeezePolicy` is a grid axis — training picks the best reaction per cell of the exit tensor.
 
 <CardGroup cols={2}>
-  <Card title="none" icon="arrow-right">
+  <Card title="none" icon="arrow-right" href="/concepts/exit-tensor">
     Normal entry. The cascade metrics are recorded in `volRegime` and `origin`, but no special action is taken. The position enters as if the cascade were not detected.
   </Card>
-  <Card title="tighten" icon="compress">
+  <Card title="tighten" icon="compress" href="/concepts/exit-tensor">
     Entry proceeds, but `trailingTake` is multiplied by `tightenFactor` (default `0.5`) — halved. The signal returns `action: "tighten"` and the `exit.trailingTake` is already tightened. Exit earlier, before the reversal arrives.
   </Card>
-  <Card title="veto" icon="ban">
+  <Card title="veto" icon="ban" href="/concepts/exit-tensor">
     Skip the signal entirely. The position is never opened. A vetoed signal **never appears** in the output of `signals()`, `plan()`, or `backtest()`. Prod code never sees it — no `if (veto) continue` is needed.
   </Card>
-  <Card title="invert" icon="arrows-rotate">
+  <Card title="invert" icon="arrows-rotate" href="/concepts/exit-tensor">
     Enter **against** the post direction. A channel posted short → the cascade squeezes upward → `signals()` returns `action: "invert"`, `direction: "long"` (already flipped). The exit is resolved from the inverse cell of the tensor. `origin.invertedFrom` carries the original channel direction.
   </Card>
 </CardGroup>
@@ -165,7 +165,7 @@ const features = volumeFeatures(
 ```
 
 <Warning>
-  **Vetoed signals never appear in output.** When `squeezePolicy` is `"veto"` and both `volZ >= volZThreshold` and `squeezePressure >= squeezeThreshold`, the signal is filtered out internally by `signals()`, `plan()`, and `backtest()`. It does not appear as a record with a special flag — it is simply absent. Do not write `if (s.action === "veto") skip()` in prod code; that branch will never execute.
+  **Vetoed signals never appear in output.** When `squeezePolicy` is `"veto"` and `squeezePressure >= squeezeThreshold`, the signal is filtered out internally by `signals()`, `plan()`, and `backtest()`. It does not appear as a record with a special flag — it is simply absent. Do not write `if (s.action === "veto") skip()` in prod code; that branch will never execute.
 
   If you need to see vetoed signals for research (for example, to count how many entries were blocked), use `model.dump()` — the signal history includes records with `entered: false` and `reason: "cascade-veto"`.
 </Warning>

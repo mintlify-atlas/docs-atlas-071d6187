@@ -1,7 +1,7 @@
 ---
-title: "Statistics Functions: Sharpe, DSR, PBO, SPA, and Moment Stats"
+title: "Statistics: Sharpe, DSR, PBO, SPA, and Moment Functions"
 sidebarTitle: "Statistics"
-description: "Reference for pump-anomaly's exported pure statistical functions: sharpe, deflatedSharpe, probabilityOfBacktestOverfitting, realityCheckPValue, certifyStrategy, and moment statistics."
+description: "pump-anomaly stat functions — sharpe, deflatedSharpe, certifyStrategy, PBO, SPA, minTRL, and moment statistics. Pure, no external dependencies."
 ---
 
 All statistics functions in `pump-anomaly` are **pure over arrays of per-trade returns** — they take plain `number[]` inputs, produce deterministic outputs, and have no external dependencies. They implement the full López de Prado / White / Hansen certification pipeline so you can distinguish a genuine edge from a brute-force grid-search artifact.
@@ -543,12 +543,12 @@ Fraction of positive returns. Exported for reporting; **not** used as the traini
 ### `percentile`
 
 ```typescript
-percentile(arr: number[], p: number): number
+percentile(xs: number[], p: number): number
 ```
 
 The `p`-th quantile via **linear interpolation (type-7, matching NumPy)**. Non-finite values are silently dropped before computation — a single bad candle cannot corrupt a P95.
 
-<ParamField path="arr" type="number[]" required>
+<ParamField path="xs" type="number[]" required>
   Numeric sample. Non-finite values are filtered out.
 </ParamField>
 <ParamField path="p" type="number" required>
