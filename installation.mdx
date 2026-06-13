@@ -1,0 +1,231 @@
+---
+title: "Install pump-anomaly in Your TypeScript Project"
+sidebarTitle: "Installation"
+description: "Add pump-anomaly to your project with npm, yarn, or pnpm. Requires TypeScript 5.3+ and a getCandles adapter for 1-minute OHLCV data."
+---
+
+`pump-anomaly` is a pure TypeScript package published to npm. It ships both an ESM (`index.mjs`) and a CommonJS (`index.cjs`) build under the package `exports` field, so it works in modern Node.js ESM projects, bundlers, and legacy CJS environments without any extra configuration. The only peer dependency is TypeScript itself.
+
+---
+
+## Install
+
+<CodeGroup>
+  ```bash npm
+  npm install pump-anomaly
+  ```
+
+  ```bash yarn
+  yarn add pump-anomaly
+  ```
+
+  ```bash pnpm
+  pnpm add pump-anomaly
+  ```
+</CodeGroup>
+
+---
+
+## Requirements
+
+<CardGroup cols={2}>
+  <Card
+    title="TypeScript ^5.3.0"
+    icon="code"
+    href="https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-3.html"
+  >
+    TypeScript is declared as a **peer dependency**. Install it alongside `pump-anomaly` — any version `5.3.0` or later is compatible.
+  </Card>
+  <Card
+    title="Node.js 18+"
+    icon="node"
+    href="https://nodejs.org/en/about/previous-releases"
+  >
+    The library uses native `structuredClone`, `Array.at()`, and modern Promise APIs. Node.js 18 LTS or later is required.
+  </Card>
+  <Card
+    title="ESM or CJS"
+    icon="boxes-stacked"
+    href="https://nodejs.org/api/esm.html"
+  >
+    The package exports both `index.mjs` (ESM) and `index.cjs` (CJS) via the `exports` field. Both build targets include full TypeScript declarations from `types.d.ts`.
+  </Card>
+  <Card
+    title="getCandles adapter"
+    icon="plug"
+    href="/api/get-candles"
+  >
+    You must supply a `GetCandles` function that fetches 1-minute OHLCV data from your exchange. The library cannot operate without one for training or cascade detection.
+  </Card>
+</CardGroup>
+
+---
+
+## TypeScript Configuration
+
+`pump-anomaly` uses standard TypeScript generics and does not require any special compiler options beyond what a modern TypeScript project already uses. The recommended `tsconfig.json` settings for ESM projects are:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true
+  }
+}
+```
+
+For projects that still use the classic `CommonJS` module format:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true
+  }
+}
+```
+
+<Note>
+  The `moduleResolution: "NodeNext"` setting is required when `"type": "module"` is set in your `package.json`. If you are using a bundler such as Vite or esbuild, `moduleResolution: "Bundler"` also works correctly with `pump-anomaly`'s dual-format exports.
+</Note>
+
+---
+
+## The getCandles Adapter
+
+`pump-anomaly` needs a single async function — your `GetCandles` adapter — to fetch 1-minute OHLCV candles from any exchange or data source. The library calls it during training to replay exits on historical candles, and during `plan()` to fetch the pre-signal candle window for liquidation-cascade detection.
+
+See [/api/get-candles](/api/get-candles) for the complete API reference and adapter examples. The required type signature is:
+
+```typescript
+import type { GetCandles, ICandleData, CandleInterval } from "pump-anomaly";
+
+// CandleInterval = "1m"|"3m"|"5m"|"15m"|"30m"|"1h"|"2h"|"4h"|"6h"|"8h"|"1d"
+//
+// ICandleData = {
+//   timestamp: number;  // unix ms, candle OPEN time
+//   open: number;
+//   high: number;
+//   low: number;
+//   close: number;
+//   volume: number;
+// }
+
+const getCandles: GetCandles = async (
+  symbol: string,
+  interval: CandleInterval,
+  limit?: number,
+  sDate?: number,   // inclusive, unix ms
+  eDate?: number,   // exclusive, unix ms
+): Promise<ICandleData[]> => {
+  // implement with your exchange SDK or REST client
+};
+```
+
+The library handles large candle windows internally with `fetchCandlesChunked`, so your adapter does not need to paginate. A broken symbol (data gap, unknown ticker) should throw — the library catches per-symbol errors and degrades gracefully rather than crashing the entire `fit()` or `plan()` call.
+
+<Tip>
+  If your project already uses [`backtest-kit`](https://www.npmjs.com/package/backtest-kit), you can wire `Exchange.getRawCandles` directly as the `GetCandles` adapter — the argument order matches one-to-one and no wrapper is needed.
+</Tip>
+
+---
+
+## Import Examples
+
+### Named Exports (ESM)
+
+```typescript
+// The high-level facade — covers all production use cases:
+import { PumpMatrix } from "pump-anomaly";
+
+// Lower-level utilities and training helpers:
+import { predict, DEFAULT_GRID, silentProgress } from "pump-anomaly";
+
+// Type-only imports (erased at compile time):
+import type {
+  ParserItem,
+  GetCandles,
+  ICandleData,
+  TradeSignal,
+  BacktestSignal,
+  BacktestResult,
+  SignalPolicy,
+  TrainOptions,
+  TrainGrid,
+} from "pump-anomaly";
+
+// Statistics exports (pure functions, no dependencies):
+import {
+  deflatedSharpe,
+  probabilityOfBacktestOverfitting,
+  realityCheckPValue,
+  minTrackRecordLength,
+  certifyStrategy,
+  sharpe,
+  mean,
+  skewness,
+  kurtosis,
+  normalCdf,
+  normalInv,
+} from "pump-anomaly";
+
+// Meta-ledger (loop / multi-fit overfitting guard):
+import {
+  emptyLedger,
+  recordAttempt,
+  canRefit,
+  effectiveTrials,
+} from "pump-anomaly";
+```
+
+### CommonJS (require)
+
+```javascript
+// Full facade and utilities:
+const { PumpMatrix, predict, DEFAULT_GRID, silentProgress } = require("pump-anomaly");
+
+// Statistics:
+const {
+  deflatedSharpe,
+  certifyStrategy,
+  sharpe,
+} = require("pump-anomaly");
+
+// Meta-ledger:
+const { emptyLedger, recordAttempt, canRefit } = require("pump-anomaly");
+```
+
+### ESM with Dynamic Import (lazy loading)
+
+```typescript
+// Load pump-anomaly only when needed (e.g. in a serverless function):
+const { PumpMatrix } = await import("pump-anomaly");
+const model = PumpMatrix.load(savedJson);
+const trades = model.signals(liveItems);
+```
+
+---
+
+## Verify the Install
+
+Run the following snippet to confirm the package installed correctly and exports are accessible:
+
+```typescript
+import { PumpMatrix, DEFAULT_GRID, silentProgress } from "pump-anomaly";
+
+// DEFAULT_GRID is a plain object — no instantiation needed:
+console.log("Default staleMinutes options:", DEFAULT_GRID.staleMinutes);
+// → [60, 240, 720]
+
+console.log("silentProgress is a function:", typeof silentProgress === "function");
+// → true
+
+console.log("PumpMatrix.fit is a function:", typeof PumpMatrix.fit === "function");
+// → true
+```

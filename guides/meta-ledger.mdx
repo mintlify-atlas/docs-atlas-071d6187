@@ -1,0 +1,187 @@
+---
+title: "Meta-Ledger: Prevent Overfitting Across Repeated Training Runs"
+sidebarTitle: "Meta-Ledger"
+description: "Use MetaLedger to guard against meta-winner's-curse when running PumpMatrix.fit() repeatedly in a rolling retraining loop."
+---
+
+The statistical certificate (`certified: true`) guards against overfitting **within** a single `fit()` call — DSR penalizes the N configurations searched in that run. But consider a rolling retraining loop that calls `fit()` 720 times over a month (once per hour) and promotes the model to live trading only when `certified: true`. That is itself a search over 720 trials. A single-fit certificate is blind to this chain: each "certified" run can be the lucky outlier among all 720 attempts, and the loop has no way to know. `meta-ledger.ts` closes this gap in code, not with operator discipline.
+
+---
+
+## Two Guards
+
+<CardGroup cols={2}>
+  <Card title="Cadence Guard" icon="clock">
+    `canRefit(ledger, now)` refuses a `fit()` call that comes too soon after the last one. Frequent refit multiplies trials at the meta level; disallowing it prevents the multiplication before it starts.
+  </Card>
+  <Card title="Family-Wise DSR Correction" icon="calculator">
+    When `metaLedger` is passed to `fit()`, DSR's trial count becomes `effectiveTrials = Σ configs across ALL past attempts`, not just the current grid. The denominator is honest only because every attempt — successful or not — is logged.
+  </Card>
+</CardGroup>
+
+---
+
+## Cadence Guard (`canRefit`)
+
+`canRefit` enforces a minimum interval between `fit()` calls. The default is **1 week** (`minRefitMs: 7 * 24 * 3600_000`). A call that arrives too soon is rejected with a human-readable reason and the timestamp of the next allowed refit.
+
+```typescript
+import { emptyLedger, canRefit } from "pump-anomaly";
+
+const ledger = emptyLedger();
+const gate = canRefit(ledger, Date.now());
+// gate: { allowed: boolean, reason: string, nextAllowedTs: number }
+
+if (!gate.allowed) {
+  console.log(gate.reason);
+  // "too-frequent refit: 156.4h until next allowed.
+  //  Frequent refit multiplies trials (meta-winner's-curse)."
+  console.log(new Date(gate.nextAllowedTs).toISOString());
+}
+```
+
+The first call on an empty ledger is always allowed (`reason: "first fit"`). Subsequent calls are allowed only after `minRefitMs` has elapsed since the last logged attempt.
+
+Override the minimum interval via the optional `policy` argument:
+
+```typescript
+const gate = canRefit(ledger, Date.now(), { minRefitMs: 14 * 24 * 3600_000 }); // 2 weeks
+```
+
+---
+
+## Family-Wise DSR Correction
+
+Pass `metaLedger` to `fit()` to make DSR's trial count honest across the entire chain of retraining runs:
+
+```typescript
+import { effectiveTrials } from "pump-anomaly";
+
+// effectiveTrials = sum of innerTrials across ALL past attempts + current grid size
+// This is what DSR sees as nTrials when metaLedger is provided
+```
+
+The `effectiveTrials` function sums `innerTrials` (grid size) across all logged attempts and adds the current run's grid size:
+
+```typescript
+export function effectiveTrials(
+  ledger: MetaLedgerState,
+  currentInnerTrials: number,
+): number {
+  const past = ledger.attempts.reduce((s, a) => s + a.innerTrials, 0);
+  return Math.max(past + currentInnerTrials, currentInnerTrials, 1);
+}
+```
+
+If a Solana grid covers ~5,000 configurations per run and you have run `fit()` 10 times, the effective trial count is 50,000 — and DSR's correction will be proportionally more stringent. A genuine edge still survives; a lucky artifact does not.
+
+---
+
+## Full Loop Pattern
+
+```typescript
+import { PumpMatrix } from "pump-anomaly";
+import { emptyLedger, recordAttempt, canRefit } from "pump-anomaly";
+import * as fs from "fs";
+
+// Load persisted ledger state between process restarts
+let ledger = fs.existsSync("ledger.json")
+  ? JSON.parse(fs.readFileSync("ledger.json", "utf8"))
+  : emptyLedger();
+
+// --- on each scheduled tick ---
+
+const gate = canRefit(ledger, Date.now());
+
+if (!gate.allowed) {
+  console.log(`Refit blocked: ${gate.reason}`);
+  console.log(`Next allowed: ${new Date(gate.nextAllowedTs).toISOString()}`);
+} else {
+  // Pass the ledger so DSR uses effectiveTrials, not just innerTrials
+  const model = await PumpMatrix.fit(history, getCandles, {
+    metaLedger: ledger,
+  });
+
+  // Log EVERY attempt — certified or not
+  // Logging only certified runs understates N and makes the correction lie
+  ledger = recordAttempt(ledger, {
+    ts: Date.now(),
+    innerTrials: model.innerTrials,        // grid size of this fit
+    certifiedNaive: model.certification.certified,
+  });
+
+  // Persist the updated ledger
+  fs.writeFileSync("ledger.json", JSON.stringify(ledger));
+
+  // Audit fields on the model
+  console.log("effectiveTrials:", model.effectiveTrials); // Σ configs across all fits
+  console.log("fitAttempts:", model.fitAttempts);         // how many times fit has run
+  console.log("innerTrials:", model.innerTrials);         // grid size of this fit
+
+  if (model.certification.certified) {
+    // Only promote when certified WITH the family-wise correction applied
+    fs.writeFileSync("model.json", model.save());
+  } else {
+    console.warn("Not certified:", model.certification.reasons);
+  }
+}
+```
+
+---
+
+## The Two Invariants
+
+<Steps>
+  <Step title="Never tune to pass the certificate">
+    An orchestrator (or LLM operator) may decide whether to retrain or escalate, but must never adjust grid ranges or certification thresholds in order to pass the certificate. The certificate is an independent judge; if you tune toward it, it becomes an overfitter.
+  </Step>
+  <Step title="Log every attempt, not just successes">
+    `recordAttempt` must be called whether `certifiedNaive` is `true` or `false`. Logging only successful runs understates N — the effective trial count is wrong, and the correction is a lie. The denominator must count all trials to remain honest.
+  </Step>
+</Steps>
+
+---
+
+## Guarantee
+
+The guarantee is verified by `meta-ledger.test.ts`:
+
+- **720 `fit()` runs on pure noise** produce false naive certificates at a non-zero rate (the single-fit certificate cannot guard against 720 attempts).
+- **With the family-wise correction** (`metaLedger` passed to `fit()`), false certificates across those 720 runs drop to **0**.
+- **A genuine 0.75σ edge** survives the same family-wise correction — the correction does not destroy real signal, only brute-force artifacts.
+
+This means the loop *cannot* "click" its way to a certificate by re-running, and the engine is safe-by-construction rather than safe-by-discipline.
+
+---
+
+## `MetaLedgerState`
+
+The state is fully serializable — a plain JSON object. Persist it between process ticks (file, database, environment variable), pass it to `canRefit` and `fit`, and update it with `recordAttempt` after each run.
+
+```typescript
+interface FitAttempt {
+  ts: number;                 // when the fit was run (ms epoch)
+  innerTrials: number;        // grid size of this fit
+  certifiedNaive: boolean;    // was this fit certified by its own (naive) certificate?
+}
+
+interface MetaLedgerState {
+  attempts: FitAttempt[];     // ALL attempts — certified and not
+}
+```
+
+Helper functions:
+
+```typescript
+import {
+  emptyLedger,      // MetaLedgerState — starts empty
+  canRefit,         // (ledger, now, policy?) → { allowed, reason, nextAllowedTs }
+  recordAttempt,    // (ledger, attempt) → new MetaLedgerState (immutable update)
+  effectiveTrials,  // (ledger, currentInnerTrials) → number
+  fitAttemptCount,  // (ledger) → number — total fits logged so far
+} from "pump-anomaly";
+```
+
+<Warning>
+Log **every** `fit()` attempt — including runs where `certifiedNaive: false`. Logging only successful attempts understates N, makes `effectiveTrials` too small, and allows the family-wise DSR correction to be fooled. The invariant is unconditional: every run gets recorded.
+</Warning>

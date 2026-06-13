@@ -1,0 +1,140 @@
+---
+title: "Statistical Certification: Five Barriers Against Overfitting"
+sidebarTitle: "Certification"
+description: "Understand pump-anomaly's five-barrier statistical certificate (DSR, PBO, SPA, minTRL, nested OOS) that proves an edge is real before allowing live trading."
+---
+
+Grid search is `argmax` over thousands of CV scores. Even when the true edge is exactly zero, the maximum of N noisy estimates is biased upward by approximately `σ · √(2 · ln N)`. The one-standard-error rule (see [Training](/guides/training)) softens this, but it does not *prove* the surviving edge is real. The statistical certificate does. It is an independent judge applied to the already-selected configuration — it is never used as an input to selection, because using it to pick configs would make it overfittable and defeat the point.
+
+---
+
+## The Five Barriers
+
+All five barriers must pass simultaneously. `certified: true` requires the edge to survive every one of them. The literature sources are López de Prado (DSR 2014, PBO 2015, minTRL), White (Reality Check 2000), and Hansen (SPA 2005).
+
+| Barrier | Function | Catches | Threshold |
+|---|---|---|---|
+| **DSR** (Deflated Sharpe) | `deflatedSharpe` | Edge doesn't survive the correction for N trials + skew / kurtosis / length | ≥ 0.95 |
+| **PBO** (CSCV overfit) | `probabilityOfBacktestOverfitting` | The IS-best configuration is systematically poor OOS | ≤ 0.10 |
+| **SPA / Reality Check** | `realityCheckPValue` | The whole edge is explainable by data-snooping (stationary bootstrap) | p ≤ 0.05 |
+| **minTRL** | `minTrackRecordLength` | The sample is physically too small for significance | N ≥ minTRL |
+| **Nested OOS** | (from `train`) | The unbiased out-of-sample forecast is not positive | > 0 |
+
+<Accordion title="DSR — Deflated Sharpe Ratio">
+DSR asks: given that we searched N configurations and observed the selected strategy's Sharpe `SR`, what is the probability that the **true** Sharpe exceeds the expected maximum Sharpe from random search at this sample size?
+
+```
+DSR = Φ( (SR − SR₀) · √(T−1) / √(1 − skew·SR + (kurt−1)/4 · SR²) )
+```
+
+`SR₀ = expectedMaxSharpe(varSR, N)` is the "luck bar" — how high a Sharpe you expect to see by chance from N independent trials with variance `varSR`. The denominator corrects for fat tails (high kurtosis) and asymmetry (skewness) in the return distribution. DSR ≥ 0.95 means there is a ≥ 95% probability the edge is real after accounting for the search.
+</Accordion>
+
+<Accordion title="PBO — Probability of Backtest Overfitting (CSCV)">
+PBO uses Combinatorially-Symmetric Cross-Validation. The performance matrix `perf[config][fold]` is split into all `C(S, S/2)` IS/OOS combinations. On each combination the best IS config is identified; its OOS rank is recorded. PBO is the fraction of splits where the IS-best config falls below median OOS performance (logit rank < 0). PBO ≤ 0.10 means the selected configuration generalizes — the IS winner is not systematically a fluke.
+</Accordion>
+
+<Accordion title="SPA / Reality Check — Stationary Bootstrap">
+White's Reality Check and Hansen's SPA test the null hypothesis "the best of N strategies is no better than a zero benchmark." The test statistic is `V = max_k √T · mean(returns_k)`. Under H₀, centered returns are bootstrap-resampled using Politis-Romano stationary blocks (preserving autocorrelation). The p-value is the fraction of bootstrap V values that exceed the observed V. p ≤ 0.05 means the edge cannot be explained purely by data-snooping.
+</Accordion>
+
+<Accordion title="minTRL — Minimum Track Record Length">
+`minTRL` is the minimum number of trades needed for the observed Sharpe to be statistically significant at α = 0.05, corrected for skewness and kurtosis:
+
+```
+minTRL = 1 + [1 − skew·SR + (kurt−1)/4 · SR²] · (Z_α / SR)²
+```
+
+If SR ≤ 0 (losing strategy), minTRL = ∞ — significance of a positive edge is never achievable regardless of N. If `actualN < minTRL`, the sample is physically too small; any conclusions are premature.
+</Accordion>
+
+---
+
+## Reading the Certification Object
+
+```typescript
+model.certification;
+// {
+//   certified: boolean;             // false → the model should NOT trade
+//   dsr: number;                    // Deflated Sharpe — target ≥ 0.95
+//   pbo: number;                    // PBO — target ≤ 0.10
+//   spaPValue: number;              // SPA p-value — target ≤ 0.05
+//   minTRL: number;                 // minimum track record length
+//   actualN: number;                // actual number of trades
+//   nestedScore: number | null;     // unbiased nested OOS score — target > 0
+//   reasons: string[];              // WHY it was not certified (empty when certified)
+// }
+```
+
+When `certified: false`, `reasons` is populated with human-readable explanations for each failing barrier, for example:
+
+```
+"DSR 0.421 < 0.95 — edge doesn't survive correction for 4320 trials"
+"N=17 < minTRL=34 — sample too small"
+```
+
+---
+
+## `certified: false` is an Honest Refusal
+
+Training still ran. The grid argmax still picked a winner. But the certificate says that winner is a brute-force artifact, not a real edge. The e2e test `fit-noise-rejection` demonstrates this property: a full `fit` on a pure random walk *does* learn a "best" configuration with a positive CV score, and the certificate correctly returns `certified: false`.
+
+This is the layer `reliable` cannot provide. `reliable: true` only means there were enough stable, significant trades in the dataset. It does not see the winner's curse of the search itself. A dataset with 200 stable trades from a genuinely random price process will pass `reliable` and fail `certified`.
+
+---
+
+## `reliable` vs `certified`
+
+These two properties answer different questions and both are required:
+
+<CardGroup cols={2}>
+  <Card title="reliable: true" icon="database">
+    Data quality — enough trades, the edge was stable across folds, and it was statistically distinguishable from zero within the dataset. Tells you the training data was sound.
+  </Card>
+  <Card title="certified: true" icon="shield-check">
+    Edge reality — the selected configuration survives all five barriers against winner's curse. Tells you the edge is not a brute-force search artifact.
+  </Card>
+</CardGroup>
+
+You need both. A model can be:
+
+- `reliable: false, certified: false` — thin data, and the found edge is an artifact. Do not trade.
+- `reliable: true, certified: false` — solid data volume and stability, but the grid search inflated the result. Do not trade.
+- `reliable: false, certified: true` — rare in practice; edge survived statistical tests but data is thin. Trade cautiously, check `minTRL`.
+- `reliable: true, certified: true` — data is solid and the edge is real. Safe to trade.
+
+---
+
+## Overriding Thresholds
+
+The default thresholds (DSR ≥ 0.95, PBO ≤ 0.10, SPA p ≤ 0.05) are from the literature. You can override them by calling `certifyStrategy` directly:
+
+```typescript
+import { certifyStrategy } from "pump-anomaly";
+
+const cert = certifyStrategy(
+  {
+    selectedReturns,
+    nTrials,
+    varSRAcrossTrials,
+    perfMatrix,
+    candidateReturns,
+    nestedScore,
+  },
+  {
+    dsr: 0.90,   // looser DSR threshold
+    pbo: 0.15,   // looser PBO threshold
+    spa: 0.10,   // looser SPA threshold
+  },
+);
+```
+
+All five barrier functions are also exported individually: `deflatedSharpe`, `probabilityOfBacktestOverfitting`, `realityCheckPValue`, `minTrackRecordLength`, `expectedMaxSharpe`. Moment statistics (`mean`, `variance`, `skewness`, `kurtosis`), normal distribution utilities (`normalCdf`, `normalInv`), and the bootstrap primitive (`stationaryBootstrapResample`, `mulberry32`) are exported too.
+
+<Warning>
+`certified: false` means the model **should not trade**. A previously-certified model that returns `certified: false` on a retrain is a regime-shift alarm — the edge that existed before has decayed. Do not override the certificate to force trading.
+</Warning>
+
+<Note>
+`certified` alone is blind to **repeated `fit()` calls**. Running `fit` 720 times over a month and trading only when `certified: true` is itself a search over 720 trials — each certified run can be the outlier among those 720 attempts. A single-fit certificate cannot see this chain. The [Meta-Ledger](/guides/meta-ledger) guide explains how to guard against this meta-level overfitting.
+</Note>

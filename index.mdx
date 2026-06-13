@@ -1,20 +1,103 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Pump Anomaly: Synchronized Crypto Pump Signal Detector"
+sidebarTitle: "Home"
+description: "Detect synchronized cryptocurrency pump signals from Telegram channels, deduplicate single-actor manipulation, and generate certified, executable trade plans."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Pump Anomaly is a TypeScript library that turns a stream of Telegram trading recommendations into statistically certified, ready-to-execute trade signals. It separates **real capital inflow** (independent authors hitting the same ticker in sync) from single-actor manipulation, detects stop-hunting traps via liquidation-cascade analysis, and produces a complete exit plan trained on your actual production exit — not close-to-close approximations.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Train a model, load it in production, and execute your first signals in minutes.
+  </Card>
+  <Card title="How It Works" icon="brain" href="/concepts/how-it-works">
+    Understand the five-layer detector pipeline and how signals are validated.
+  </Card>
+  <Card title="PumpMatrix API" icon="code" href="/api/pump-matrix">
+    Full reference for fit, load, signals, plan, backtest, and all model properties.
+  </Card>
+  <Card title="Per-Asset Grids" icon="sliders" href="/guides/per-asset-grids">
+    Pre-tuned TrainGrid configurations for 15 cryptocurrencies from BTC to Fartcoin.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What it solves
+
+Pump Anomaly addresses three distinct problems that naive close-to-close signal detection misses:
+
+<Steps>
+  <Step title="Separate real inflow from single-actor manipulation">
+    A single actor running 10 anonymous Telegram channels looks like synchronized activity. Pump Anomaly's author-cluster deduplication (union-find over cross-correlation) collapses sibling channels into one author before counting independent votes — so a true multi-author burst is required for a matrix-mode signal.
+  </Step>
+  <Step title="Separate pumps from stop-hunting traps">
+    A wick into leveraged positions triggers a liquidation cascade. Close-to-close labeling misses this — the candle *closes* positive but the position was stopped out on the wick. Path-aware exit replay on 1-minute OHLC data labels every training sample using the same trailing-take / hard-stop / life-cap logic your production code runs.
+  </Step>
+  <Step title="Produce statistically certified, executable plans">
+    Grid search over thousands of configurations is guaranteed to find a "best" config even on pure noise. Pump Anomaly applies five independent statistical barriers (Deflated Sharpe, PBO, SPA, minTRL, nested-CV OOS) after training to distinguish real edges from brute-force artifacts — and refuses to trade when the evidence doesn't hold up.
+  </Step>
+</Steps>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Author-Cluster Deduplication" icon="users">
+    Union-find clustering over lag cross-correlation collapses sibling channels. Only independent author clusters vote on matrix-mode signals.
+  </Card>
+  <Card title="Path-Aware Exit Replay" icon="chart-line">
+    Training labels come from simulating your exact production exit (trailing take, hard stop, life-cap) on 1m candles — not two price points.
+  </Card>
+  <Card title="Liquidation Cascade Detection" icon="triangle-exclamation">
+    Symmetric volZ + squeezePressure analysis detects stop-hunting on both long and short positions. Four configurable policies: none, tighten, veto, invert.
+  </Card>
+  <Card title="Statistical Certification" icon="certificate">
+    Five-barrier gate (DSR, PBO, SPA, minTRL, nested OOS) built from López de Prado and White's methodology. `certified: false` means don't trade.
+  </Card>
+  <Card title="Exit Tensor with Fallback" icon="table-cells">
+    Exit parameters trained separately per `[mode][channel][symbol][direction][volRegime]` cell with hierarchical fallback — no magic constants.
+  </Card>
+  <Card title="Meta-Overfitting Guard" icon="shield">
+    MetaLedger tracks every fit attempt. Family-wise DSR correction and a cadence gate prevent "click your way to a certificate" failure modes.
+  </Card>
+</CardGroup>
+
+## Quick example
+
+```typescript
+import { PumpMatrix } from "pump-anomaly";
+import * as fs from "fs";
+
+// Train once on historical Telegram signals
+const model = await PumpMatrix.fit(history, getCandles);
+
+// Only certified models should trade
+if (!model.certification.certified) {
+  console.warn("Edge not proven:", model.certification.reasons);
+  process.exit(1);
+}
+
+// Serialize for production
+fs.writeFileSync("model.json", model.save());
+
+// In production — no retraining needed
+const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
+const trades = await model.plan(liveItems, getCandles);
+
+for (const s of trades) {
+  openPosition(s.symbol, s.direction, { from: s.entryFromPrice, to: s.entryToPrice }, s.exit);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Training Guide" icon="graduation-cap" href="/guides/training">
+    Learn grid search, K-fold CV, and the one-standard-error winner selection rule.
+  </Card>
+  <Card title="Certification" icon="shield-check" href="/guides/certification">
+    Understand all five statistical barriers and when a model is safe to trade.
+  </Card>
+  <Card title="Live Trading" icon="bolt" href="/guides/live-trading">
+    Use plan() for look-ahead-free live decisions with cascade detection.
+  </Card>
+  <Card title="Backtesting" icon="clock-rotate-left" href="/guides/backtesting">
+    Replay signals over closed history to measure realized PnL with backtest().
+  </Card>
+</CardGroup>

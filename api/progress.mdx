@@ -1,0 +1,161 @@
+---
+title: "Training Progress Callbacks: stdoutProgress and silentProgress"
+sidebarTitle: "Progress"
+description: "Reference for pump-anomaly's training progress API — ProgressFn, ProgressEvent, stdoutProgress (default bar), and silentProgress (no-op)."
+---
+
+By default, `fit()` and `train()` write a live progress bar to `process.stdout` while the model trains. Training involves nested loops — slow IO-bound candle labelling followed by fast in-memory grid scoring — and the bar tracks progress across all of them. You can silence the output entirely, or replace it with any custom callback by passing `onProgress` in the `TrainOptions`.
+
+---
+
+## `ProgressEvent`
+
+Every tick from the training pipeline delivers a `ProgressEvent` to the registered callback:
+
+```typescript
+interface ProgressEvent {
+  /** Which training phase is currently running */
+  phase: "label" | "score" | "nested";
+  /** Number of units completed in this phase */
+  done: number;
+  /** Total units in this phase */
+  total: number;
+  /** Current item being processed — symbol during labeling, grid key during scoring */
+  label: string;
+}
+```
+
+<ResponseField name="phase" type='"label" | "score" | "nested"'>
+  Identifies the current work phase:
+  - `"label"` — per-candle labelling of each candidate burst (IO-bound; one tick per symbol fetched). This is the slow phase — it calls `getCandles` over 1m data for each signal in the history.
+  - `"score"` — scoring each configuration in the grid against the cached labels (CPU-bound; fast). One tick per grid position evaluated.
+  - `"nested"` — outer folds of the nested cross-validation for the unbiased OOS estimate. One tick per outer fold.
+</ResponseField>
+<ResponseField name="done" type="number">
+  How many units of work have been completed so far in this phase. Starts at `1` on the first tick; reaches `total` on the last.
+</ResponseField>
+<ResponseField name="total" type="number">
+  Total units of work in this phase. `stdoutProgress` skips rendering when `total ≤ 0` to avoid division-by-zero.
+</ResponseField>
+<ResponseField name="label" type="string">
+  Human-readable context for the current tick. During `"label"` phase this is the trading symbol being fetched (e.g. `"TRXUSDT"`). During `"score"` phase it is a pipe-delimited grid key (e.g. `"5|0.4|0.6|all"`). During `"nested"` it identifies the outer fold.
+</ResponseField>
+
+---
+
+## `ProgressFn`
+
+```typescript
+type ProgressFn = (event: ProgressEvent) => void;
+```
+
+A synchronous callback that receives one `ProgressEvent` per unit of work. The callback is called from inside the `fit()` / `train()` async loop; it should return quickly and must not throw.
+
+Pass a `ProgressFn` as `onProgress` in `TrainOptions`:
+
+```typescript
+await PumpMatrix.fit(history, getCandles, { onProgress: myProgressFn });
+```
+
+---
+
+## `stdoutProgress`
+
+```typescript
+const stdoutProgress: ProgressFn
+```
+
+The **default progress bar** — used automatically when no `onProgress` option is supplied to `fit()`. Writes a fixed-width bar to `process.stdout` using `\r` (carriage return) to overwrite the current line:
+
+```
+[██████████████░░░░░░░░░░░░░░░░] 47% (42/90) label TRXUSDT
+```
+
+On the final tick of a phase (`done >= total`), the bar is followed by `\n` to advance to the next line.
+
+**Fixed-width rendering.** The line is padded to 80 characters and then sliced to exactly 80 characters before writing. This prevents visual artefacts when a shorter symbol name follows a longer one on the same line — without truncation, `\r` would leave trailing characters from the previous tick (e.g. `"SOLUSDT"` after `"FARTCOINUSDT"` would display as `"SOLUSDT NUSDT"`).
+
+**Three-phase output example:**
+
+```
+[██████████████░░░░░░░░░░░░░░░░] 47% (42/90) label TRXUSDT
+[██████████████████████████████] 100% (90/90) label SOLUSDT
+
+[████████████░░░░░░░░░░░░░░░░░░] 40% (200/500) score 5|0.4|0.6|all
+[██████████████████████████████] 100% (500/500) score 3|0.3|0.5|calm
+
+[███████████████░░░░░░░░░░░░░░░] 50% (2/4) nested fold-2
+[██████████████████████████████] 100% (4/4) nested fold-4
+```
+
+<Note>
+`stdoutProgress` silently skips any event where `total <= 0` to avoid division-by-zero when computing the fill ratio. This can occur on degenerate inputs (e.g. an empty history with zero labelling candidates). Your own callback should apply the same guard if it computes a percentage.
+</Note>
+
+---
+
+## `silentProgress`
+
+```typescript
+const silentProgress: ProgressFn
+```
+
+A **no-op progress function** — `() => {}`. Suppresses all training output. Pass it when running tests, when output would interfere with structured logging, or when `fit()` is called in a background worker.
+
+```typescript
+import { silentProgress, PumpMatrix } from "pump-anomaly";
+
+const model = await PumpMatrix.fit(history, getCandles, {
+  onProgress: silentProgress,
+});
+```
+
+---
+
+## Custom Progress Handler
+
+You can pass any `(event: ProgressEvent) => void` function as `onProgress`. The handler receives every tick across all three phases in the order they occur.
+
+```typescript
+import { PumpMatrix, silentProgress } from "pump-anomaly";
+
+// Silence all output:
+await PumpMatrix.fit(history, getCandles, { onProgress: silentProgress });
+
+// Minimal inline counter (no bar rendering):
+await PumpMatrix.fit(history, getCandles, {
+  onProgress: (e) => {
+    process.stdout.write(`\r${e.phase} ${e.done}/${e.total}`);
+  },
+});
+
+// Route to a structured logger:
+await PumpMatrix.fit(history, getCandles, {
+  onProgress: (e) => {
+    if (e.phase === "label") {
+      logger.debug({ phase: e.phase, done: e.done, total: e.total, symbol: e.label });
+    }
+  },
+});
+
+// Integrate with an external progress UI (e.g. cli-progress, ora):
+const bar = new cliProgress.SingleBar({});
+bar.start(100, 0);
+await PumpMatrix.fit(history, getCandles, {
+  onProgress: (e) => {
+    if (e.phase === "label" && e.total > 0) {
+      bar.update(Math.round((e.done / e.total) * 100));
+    }
+    if (e.done >= e.total) bar.stop();
+  },
+});
+```
+
+### `ProgressEvent` field reference for custom handlers
+
+| Field | Type | Notes |
+|---|---|---|
+| `phase` | `"label" \| "score" \| "nested"` | Current training phase |
+| `done` | `number` | Units completed (1-indexed) |
+| `total` | `number` | Total units in phase; guard against `<= 0` before dividing |
+| `label` | `string` | Symbol (`label` phase), grid key (`score` phase), fold id (`nested` phase) |

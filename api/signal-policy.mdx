@@ -1,0 +1,197 @@
+---
+title: "SignalPolicy: Baked-In Allow-List for Trade Actions"
+sidebarTitle: "SignalPolicy"
+description: "Configure which trade actions (enter, invert, tighten) are allowed at training time with SignalPolicy. Runtime policies can only narrow — never widen — the trained policy."
+---
+
+`SignalPolicy` is the serializable allow-list that controls which signal actions `PumpMatrix` is permitted to emit. It is fixed at training time and baked into the model JSON — making it part of the model's contract, not a runtime configuration. In production, the second argument to `signals()`, `plan()`, and `backtest()` can only **narrow** the trained policy for a single call; it can never re-enable actions that training forbade.
+
+This replaces the older runtime flags `disableInvert` / `disableSqueeze` with a single, version-controlled, serializable object. The invariant is: **execution never permits what training forbade**.
+
+<Warning>
+  A runtime policy passed to `signals()`, `plan()`, or `backtest()` can only narrow the trained policy — it cannot widen it. If `"invert"` was excluded from the trained allow-list, passing `{ allow: ["enter", "invert"] }` at runtime has no effect: the intersection is computed as `trained ∩ requested`, and `"invert"` is not in `trained`. To enable inversion, retrain the model with `{ policy: { allow: ["enter", "invert", "tighten"] } }`.
+</Warning>
+
+---
+
+## SignalPolicy Interface
+
+```typescript
+interface SignalPolicy {
+  allow: SignalAction[];  // "enter" | "invert" | "tighten"
+  minRiskReward?: number;
+  rrMetric?: "mean" | "p95" | "p99";
+}
+
+type SignalAction = "enter" | "invert" | "tighten";
+```
+
+<ResponseField name="allow" type="SignalAction[]" required>
+  The list of permitted signal actions. Only actions present in this array will ever be returned by `signals()`, `plan()`, or `backtest()`. Signals whose computed action is not in the allow-list are silently dropped — they never appear in the output.
+
+  - `"enter"` — standard directional entry
+  - `"invert"` — direction-reversed entry on a detected liquidation cascade
+  - `"tighten"` — entry with a tightened trailing take on a mild cascade
+
+  `veto` (the cascade detector's "don't enter" decision) is **not** a valid allow-list value. A vetoed signal is simply absent from the output — it is not representable as a `TradeSignal`. Excluding `"invert"` from the allow-list causes inversion signals to be treated like veto: they are dropped silently.
+</ResponseField>
+
+<ResponseField name="minRiskReward" type="number">
+  Optional minimum risk-reward threshold. When set, symbols whose backtest RR (measured as `pnl / hardStop`) falls below this threshold are excluded from the output. The comparison uses the metric specified by `rrMetric`. Symbols with no RR statistics are conservatively excluded (nothing to confirm them with). Default: no filter.
+</ResponseField>
+
+<ResponseField name="rrMetric" type='"mean" | "p95" | "p99"'>
+  Which RR statistic to compare against `minRiskReward`. `"mean"` uses the average RR across all trades; `"p95"` and `"p99"` filter by the right tail, keeping symbols with explosive upside while tolerating a weaker average. Default: `"mean"`.
+</ResponseField>
+
+---
+
+## Baking a Policy at Training Time
+
+Pass a `SignalPolicy` as `opts.policy` to `PumpMatrix.fit()`. The policy is stored in the trained params and serialized by `model.save()`. Every subsequent load of that model.json carries the same policy.
+
+```typescript
+// Training: allow enter and tighten — never emit inversion signals
+const model = await PumpMatrix.fit(history, getCandles, {
+  policy: {
+    allow: ["enter", "tighten"],
+  },
+});
+
+// The policy is serialized into the saved JSON
+fs.writeFileSync("model.json", model.save());
+
+// Loading restores the exact trained policy
+const loaded = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
+console.log(loaded.policy); // { allow: ["enter", "tighten"] }
+```
+
+When no `policy` is passed to `fit()`, the default allow-list is used (all three actions permitted — see [DEFAULT_POLICY](#default_policy)).
+
+---
+
+## Narrowing at Runtime
+
+The second argument to `signals()`, `plan()`, and `backtest()` is a `Partial<SignalPolicy>`. It is combined with the trained policy via intersection: the effective allow-list for that call is `trained.allow ∩ requested.allow`. Any action not in the trained policy cannot be re-added at runtime.
+
+```typescript
+// Trained with: allow enter + invert + tighten (default)
+// At runtime: further narrow to enter only for this call
+model.signals(items, { allow: ["enter"] });
+model.plan(liveItems, getCandles, { allow: ["enter"] });
+
+// This does NOT re-enable invert if training excluded it:
+// trained = { allow: ["enter", "tighten"] }
+// requested = { allow: ["enter", "invert"] }
+// effective = { allow: ["enter"] }   ← intersection, "invert" dropped
+model.signals(items, { allow: ["enter", "invert"] }); // still only "enter"
+```
+
+The intersection is computed by `intersectPolicy()` (see [intersectPolicy](#intersectpolicy)) before the signal loop runs — no signal is evaluated against a policy wider than was trained.
+
+---
+
+## Disabling Inversion
+
+Excluding `"invert"` from the allow-list means inversion signals are treated exactly like veto: they are dropped from the output and never returned. This is the correct behavior for strategies that do not want to trade against channel signals under any circumstances.
+
+```typescript
+// Training: no inversion — never trade against channel signals
+await PumpMatrix.fit(history, getCandles, {
+  policy: { allow: ["enter", "tighten"] },
+});
+```
+
+When `"invert"` is absent from the runtime policy (but present in the trained policy), the same behavior applies for that call:
+
+```typescript
+// Trained with invert allowed; runtime disables it for one call
+model.signals(items, { allow: ["enter", "tighten"] });
+```
+
+This replaced the old `disableInvert: boolean` flag with a single, serialized, inspectable object — the policy is part of the model, not ambient state.
+
+---
+
+## Risk-Reward Filter
+
+`minRiskReward` and `rrMetric` are purely runtime — they are not baked into the model at training time, because the RR statistics (`model.riskReward.bySymbol`) are already part of the trained params. The runtime policy can only **tighten** an existing `minRiskReward` (raise the threshold), never lower it.
+
+```typescript
+// Filter: only symbols with mean RR >= 1.5
+model.signals(items, { minRiskReward: 1.5 });
+
+// Filter: only symbols with P99 RR >= 5.0 (explosive upside required)
+model.signals(items, { minRiskReward: 5.0, rrMetric: "p99" });
+
+// Both plan() and backtest() accept the same policy argument
+const trades = await model.plan(liveItems, getCandles, {
+  allow: ["enter"],
+  minRiskReward: 2.0,
+});
+```
+
+Symbols that have no RR statistics in the model (e.g. first seen after training) are excluded conservatively — there is nothing to confirm them with, so they are dropped rather than passed through.
+
+The `rrMetric` options:
+- `"mean"` (default) — average RR; balanced.
+- `"p95"` — 95th-percentile RR; keeps symbols with strong typical upside.
+- `"p99"` — 99th-percentile RR; keeps symbols with explosive tail upside, useful when the strategy relies on occasional large wins.
+
+If the trained policy already includes a `minRiskReward`, the effective threshold is `max(trained.minRiskReward, requested.minRiskReward)` — the stricter of the two.
+
+---
+
+## intersectPolicy
+
+`intersectPolicy` is exported from the package and is the function that implements the readonly narrowing invariant. It computes the effective policy for a single execution call.
+
+```typescript
+function intersectPolicy(
+  trained: SignalPolicy,
+  requested?: Partial<SignalPolicy>,
+): SignalPolicy
+```
+
+```typescript
+import { intersectPolicy, DEFAULT_POLICY } from "pump-anomaly";
+
+const trained = { allow: ["enter", "invert", "tighten"] };
+
+// Narrowing: requested can only remove actions
+const effective = intersectPolicy(trained, { allow: ["enter"] });
+// → { allow: ["enter"], rrMetric: "mean" }
+
+// Attempting to widen: "invert" not in trained → dropped
+const wider = intersectPolicy(
+  { allow: ["enter"] },
+  { allow: ["enter", "invert"] },
+);
+// → { allow: ["enter"], rrMetric: "mean" }
+
+// RR: max of trained and requested (only tightening allowed)
+const rrResult = intersectPolicy(
+  { allow: ["enter"], minRiskReward: 1.5 },
+  { allow: ["enter"], minRiskReward: 1.0 },   // lower threshold — ignored
+);
+// → { allow: ["enter"], minRiskReward: 1.5, rrMetric: "mean" }
+```
+
+The function:
+1. Computes `allow` as the set intersection of `trained.allow` and `requested.allow` (with deduplication).
+2. Computes `minRiskReward` as `max(trained.minRiskReward, requested.minRiskReward)` — only tightening is permitted.
+3. Uses `requested.rrMetric ?? trained.rrMetric ?? "mean"` for the metric selector.
+
+---
+
+## DEFAULT_POLICY
+
+The default policy used when `opts.policy` is not passed to `PumpMatrix.fit()`, and also applied as a backward-compatibility default when loading a model serialized before policies were introduced.
+
+```typescript
+const DEFAULT_POLICY: SignalPolicy = {
+  allow: ["enter", "invert", "tighten"],
+};
+```
+
+All three actions are permitted. No `minRiskReward` filter. This is the most permissive policy — all cascade reactions (enter, invert, tighten) can appear in the output. To restrict a model to standard entries only, pass a custom policy at training time.

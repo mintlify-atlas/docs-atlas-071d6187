@@ -1,0 +1,143 @@
+---
+title: "Exit Tensor: Per-Source Per-Asset Trained Exit Parameters"
+sidebarTitle: "Exit Tensor"
+description: "Understand how pump-anomaly trains and resolves exit parameters (trailing take, hard stop, impact horizon) per channel, symbol, direction, and volume regime."
+---
+
+`pump-anomaly` does not copy the stop-loss and targets from the Telegram post. Instead it trains its own exit parameters — trailing take, hard stop, and impact horizon — using an exact path-aware replay of your production exit on 1m candles. These parameters are stored in a five-dimensional exit tensor that is resolved hierarchically at inference time.
+
+---
+
+## Why Per-Cell Exits
+
+Different channels, symbols, directions, and volume regimes have genuinely different dynamics. A long trap and a short trap are mirrors of the same liquidation cascade but their reversal timing and magnitude differ. A channel that posts HYPE pumps and a channel that posts BTC pumps have completely different characteristic holding times. Anomalous volume on entry arms a different risk profile than calm volume.
+
+Mixing all these contexts into a single trained exit corrupts the optimizer — the mean over incomparable regimes is not the optimal parameter for any of them. The exit tensor keeps them separate. Every cell is trained independently; a cell with no history falls back to a higher-level aggregate, which is also trained (not a magic constant).
+
+---
+
+## Tensor Dimensions
+
+The full tensor address is `[mode][channel][symbol][direction][volRegime]`:
+
+- **mode** — `"matrix"` or `"single"`. The two entry conditions have different expectancy, so their exits are trained separately. In matrix mode the burst is cross-channel; the channel dimension is stored under the canonical `"_matrix"` key instead of any real channel name.
+- **channel** — the Telegram channel that published the signal. For single mode this is the literal channel string; for matrix mode it is always `"_matrix"`.
+- **symbol** — the trading pair (e.g. `"SOLUSDT"`).
+- **direction** — `"long"` or `"short"`. A long trap and a short squeeze are different cells.
+- **volRegime** — `"calm"` or `"anomalous"`. Anomalous volume on entry means the crowd entered on leverage; the exit should be tighter to get out before the reversal.
+
+```ts
+interface ExitTensor {
+  cells: {
+    matrix: ChannelCell;   // cells[mode][channel][symbol][direction][volRegime]
+    single: ChannelCell;
+  };
+  bySymbolDir: {            // volRegime collapsed: [mode][symbol][direction]
+    matrix: Record<string, Partial<Record<Direction, ExitParams>>>;
+    single: Record<string, Partial<Record<Direction, ExitParams>>>;
+  };
+  byMode: {                 // channel/symbol/direction all collapsed
+    matrix: ExitParams;
+    single: ExitParams;
+  };
+  global: ExitParams;       // root fallback
+}
+```
+
+---
+
+## Hierarchical Fallback
+
+A cell may be empty — for example, a channel that never posted a given symbol, or a direction that was never observed. The resolver walks down a four-level fallback chain until it finds a value:
+
+```
+[mode][channel][symbol][direction][volRegime]   ← cell (most specific)
+  → [mode][symbol][direction]                   ← symbol-dir (volRegime collapsed)
+  → [mode]                                      ← mode (symbol and direction collapsed)
+  → global                                      ← root
+```
+
+Every level is trained, not defaulted to a magic number. A new channel with no history receives the mode-level or global exit, which is the aggregate over all channels in the same mode — a reasonable prior.
+
+The `resolveExit` function implements this chain and reports which level was used:
+
+```ts
+import { resolveExit } from "pump-anomaly";
+
+const { exit, source } = resolveExit(
+  tensor,
+  "single",      // mode
+  "channelA",    // channel
+  "SOLUSDT",     // symbol
+  "long",        // direction
+  "anomalous",   // volRegime
+);
+
+// source: "cell" | "symbol-dir" | "mode" | "global"
+```
+
+`origin.exitSource` in every `TradeSignal` carries this value. Use it to audit how specific the resolved exit is — a `"global"` source means the channel/symbol combination has no training history yet.
+
+---
+
+## ExitPlan Fields
+
+The resolved exit is a flat object, ready to pass directly to your order management system:
+
+```typescript
+exit: {
+  trailingTake: number;          // % pullback from peak that triggers exit
+  hardStop: number;              // % loss from entry that stops the position
+  impactHorizonMinutes: number;  // maximum position lifetime
+  stalenessSinceProfit: number;  // profit % threshold that arms the staleness exit
+  stalenessSinceMinutes: number; // minutes without a new high before staleness exit fires
+}
+```
+
+In the underlying `ExitParams` (used by `replayExit`), the full set of fields also includes the volume and cascade parameters used during training:
+
+```typescript
+interface ExitParams {
+  trailingTake: number;
+  hardStop: number;
+  stalenessSinceProfit: number;
+  stalenessSinceMinutes: number;
+  staleMinutes: number;           // impact horizon (ceiling on position life)
+  volBaselineWindow?: number;     // candles before entry used to compute volZ baseline
+  volZThreshold?: number;         // volZ threshold separating calm from anomalous
+  squeezePolicy?: "none" | "tighten" | "veto" | "invert" | "ignore";
+  squeezeThreshold?: number;      // squeezePressure threshold that triggers the policy
+  tightenFactor?: number;         // multiplier applied to trailingTake on "tighten" (default 0.5)
+  cascadeWindowMinutes?: number;  // independent cascade-detection window (not staleMinutes)
+}
+```
+
+---
+
+## resolveExit and resolveExitNoRegime
+
+Two exported functions cover the two inference contexts:
+
+```ts
+import { resolveExit, resolveExitNoRegime } from "pump-anomaly";
+```
+
+**`resolveExit`** — use when you have a `volRegime` value (i.e., candle data was available and `volRegimeOf` was called). Tries the full five-dimensional cell address first.
+
+```ts
+const { exit, source } = resolveExit(tensor, mode, channel, symbol, direction, volRegime);
+```
+
+**`resolveExitNoRegime`** — use when no candles are available (e.g., `signals()` without a candle source). The cell level requires a `volRegime`, so it is skipped; the fallback chain starts at `symbol-dir`.
+
+```ts
+const { exit, source } = resolveExitNoRegime(tensor, mode, symbol, direction);
+// starts at bySymbolDir → byMode → global
+// never reaches cells (no volRegime to look up)
+```
+
+`model.exit` exposes the full tensor for audit. `model.impactHorizonMinutes` is the global-level `staleMinutes` — the empirical post impact horizon at the root of the fallback chain.
+
+<Note>
+  **Tighten action and `tightenFactor`.** When the cascade policy fires `"tighten"`, `replayExit` applies `tightenFactor` (default `0.5`) to `trailingTake` before running the replay. The `TradeSignal.exit.trailingTake` returned by `plan()` or `signals()` is **already tightened** — it is `trailingTake * tightenFactor`. Prod code reads the final value directly; there is no separate "is this tightened?" flag to check.
+</Note>

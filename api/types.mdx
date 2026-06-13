@@ -1,0 +1,442 @@
+---
+title: "Core Types Reference: Interfaces, Enums, and Configurations"
+sidebarTitle: "Types"
+description: "Reference for pump-anomaly's core TypeScript types: DetectorConfig, TrainGrid, ViabilityConfig, ReliabilityConfig, ExitTensor, Certification, and more."
+---
+
+This page documents the core TypeScript types used throughout `pump-anomaly`. These are the contracts that govern detector configuration, training grid search, viability assessment, reliability scoring, statistical certification, exit parameter resolution, and replay simulation. All types are exported from the package and available for use in custom tooling, analytics scripts, and orchestration layers.
+
+## Direction
+
+```typescript
+type Direction = "long" | "short";
+```
+
+The trade direction. `"long"` = bullish position (expect price to rise); `"short"` = bearish position (expect price to fall). Used throughout: in `ParserItem`, `PumpVerdict`, `TradeSignal`, `ExitParams` cell keys, and the exit tensor. The library is fully symmetric — long-trap and short-trap (short squeeze and long cascade) are mirrors of the same mechanism with separate tensor cells.
+
+## DetectorMode
+
+```typescript
+type DetectorMode = "auto" | "matrix" | "single";
+```
+
+Controls which entry-selection mode the detector uses:
+
+- **`"matrix"`** — entry requires a synchronous burst across independent author clusters. Filters out single-actor manipulation (N channels of the same operator collapse to 1 cluster and do not fire).
+- **`"single"`** — every post is an entry candidate; the trained exit decides the outcome. Used as a fallback when correlation data is insufficient.
+- **`"auto"`** (default) — uses matrix mode only when the author correlation passes the viability check; otherwise falls back to single. The actual mode chosen is reported in `model.mode` and `result.usedMode`.
+
+## DEFAULT\_CONFIG
+
+The default detector configuration used when no explicit config is passed to `predict()` or `PumpMatrix.fit()`.
+
+```typescript
+const DEFAULT_CONFIG: DetectorConfig = {
+  windowK: 3,
+  minClusters: 2,
+  jaccardThreshold: 0.3,
+  lagPeakThreshold: 0.5,
+  maxBurstWindowMs: 60 * 60 * 1000,
+  mode: "auto",
+  stationarityWindowMs: Infinity,
+};
+```
+
+### DetectorConfig Fields
+
+<ResponseField name="windowK" type="number">
+  Multiplier applied to the self-tuned lag τ to define the burst-detection sliding window (`windowMs = windowK × τ`). Larger values catch slower bursts but increase false positives. Default `3`; grid searches `[2, 3, 5]`.
+</ResponseField>
+
+<ResponseField name="minClusters" type="number">
+  Minimum number of **independent** author clusters that must all signal the same `(symbol, direction)` within the burst window for a matrix entry. Channels belonging to the same operator count as one cluster. Default `2`; grid searches `[2, 3]`.
+</ResponseField>
+
+<ResponseField name="jaccardThreshold" type="number">
+  Minimum sliding-window Jaccard similarity for a channel pair to be considered structurally close (pass the coarse sieve). Default `0.3`; grid searches `[0.3, 0.4]`.
+</ResponseField>
+
+<ResponseField name="lagPeakThreshold" type="number">
+  Minimum peak sharpness (fraction of cross-correlation mass within the peak window) required for a directed lag edge to be kept. Low values → noisy edges accepted; high values → only sharp peaks kept. Default `0.5`; grid searches `[0.4, 0.5]`.
+</ResponseField>
+
+<ResponseField name="maxBurstWindowMs" type="number">
+  Hard ceiling on the burst synchrony window in milliseconds, regardless of `windowK × τ`. Default `3 600 000` (1 hour).
+</ResponseField>
+
+<ResponseField name="mode" type="DetectorMode">
+  Entry-selection mode. See [DetectorMode](#detectormode). Default `"auto"`.
+</ResponseField>
+
+<ResponseField name="viability" type="Partial<ViabilityConfig>" optional>
+  Override thresholds for the matrix viability check in `"auto"` mode. Fields not specified fall back to `DEFAULT_VIABILITY`.
+</ResponseField>
+
+<ResponseField name="stationarityWindowMs" type="number">
+  Length of the rolling stationarity window in milliseconds. Statistics (τ, author matrix, Jaccard) are computed only over the most recent `stationarityWindowMs` of data ending at the current anchor timestamp — guarding against regime drift on long horizons where channel relationships evolve. `Infinity` (default) uses the full history.
+</ResponseField>
+
+## TrainGrid
+
+`TrainGrid` defines the search space for `PumpMatrix.fit()`. Every field is an array of candidate values; the trainer evaluates all combinations using time-series K-fold cross-validation and selects the most conservative configuration within one standard error of the best CV score (Breiman 1-SE rule).
+
+```typescript
+interface TrainGrid {
+  // Authorship matrix detector
+  windowK: number[];
+  minClusters: number[];
+  jaccardThreshold: number[];
+  lagPeakThreshold: number[];
+  // Prod exit (label set by replay simulation)
+  trailingTake: number[];
+  hardStop: number[];
+  stalenessSinceProfit: number[];
+  stalenessSinceMinutes: number[];
+  staleMinutes: number[];
+  // Liquidation-cascade detector
+  volZThreshold: number[];
+  squeezePolicy: Array<"none" | "tighten" | "veto" | "invert" | "ignore">;
+  squeezeThreshold: number[];
+  volBaselineWindow: number[];
+  cascadeWindowMinutes: number[];
+  // Stationarity window
+  stationarityWindowMs: number[];
+}
+```
+
+### DEFAULT\_GRID Values and What Each Axis Controls
+
+| Axis | Default values | Controls |
+|---|---|---|
+| `windowK` | `[2, 3, 5]` | Burst window multiplier (`windowMs = windowK × τ`) |
+| `minClusters` | `[2, 3]` | Minimum independent author clusters for a matrix signal |
+| `jaccardThreshold` | `[0.3, 0.4]` | Coarse-sieve channel-proximity cutoff |
+| `lagPeakThreshold` | `[0.4, 0.5]` | Minimum lag-correlation peak sharpness |
+| `trailingTake` | `[0.5, 1.0, 2.0]` | Trailing-take pullback % from peak PnL |
+| `hardStop` | `[1.0, 2.0, 3.0]` | Hard-stop % below entry (long) / above entry (short) |
+| `stalenessSinceProfit` | `[0.5, 1.0, 2.0]` | Profit % threshold that arms the peak-staleness exit |
+| `stalenessSinceMinutes` | `[60, 120, 240]` | Minutes without a new peak before a staleness exit fires |
+| `staleMinutes` | `[60, 240, 720]` | Position life-cap in minutes (empirical impact horizon) |
+| `volZThreshold` | `[1.5, 2.5]` | Volume z-score threshold separating `calm` from `anomalous` regime |
+| `squeezePolicy` | `["none","tighten","veto","invert"]` | Reaction policy when cascade pressure exceeds threshold |
+| `squeezeThreshold` | `[0.55, 0.7]` | Squeeze-pressure fraction that triggers the policy |
+| `volBaselineWindow` | `[20]` | Number of candles before entry used as the volume baseline |
+| `cascadeWindowMinutes` | `[15, 30, 60]` | Cascade-detection window in minutes (independent of `staleMinutes`) |
+| `stationarityWindowMs` | `[7d, 14d, 28d, 56d]` | Rolling stationarity window for author-matrix statistics |
+
+Pass a `Partial<TrainGrid>` via `TrainOptions.grid` to override only the axes you want to constrain or widen.
+
+## ViabilityConfig and DEFAULT\_VIABILITY
+
+Thresholds used by the viability check in `"auto"` mode to decide whether the author correlation is trustworthy enough to use matrix mode. **All conditions must hold simultaneously.**
+
+```typescript
+interface ViabilityConfig {
+  minSharedEvents: number;  // default 3
+  minPeakShare: number;     // default 0.6
+  minStrongEdges: number;   // default 1
+  minStructure: number;     // default 2
+}
+
+const DEFAULT_VIABILITY: ViabilityConfig = {
+  minSharedEvents: 3,
+  minPeakShare: 0.6,
+  minStrongEdges: 1,
+  minStructure: 2,
+};
+```
+
+<ResponseField name="minSharedEvents" type="number">
+  The minimum number of shared `(symbol, direction)` events between any pair of channels for their overlap to be considered non-random. Below this threshold the correlation is likely a coincidence. Default `3`.
+</ResponseField>
+
+<ResponseField name="minPeakShare" type="number">
+  The minimum fraction of cross-correlation mass that must fall within the peak window for a directed lag edge to be considered "strong" (non-random timing alignment). Default `0.6`.
+</ResponseField>
+
+<ResponseField name="minStrongEdges" type="number">
+  The minimum number of strong directed edges (passing `minPeakShare`) required in the graph. Zero strong edges means no reliable leader–follower relationship was found. Default `1`.
+</ResponseField>
+
+<ResponseField name="minStructure" type="number">
+  The minimum number of independent author clusters required if no multi-channel cluster (sibling pair) was found. Ensures the graph is non-trivial: either siblings exist, or there are at least `minStructure` separate clusters. Default `2`.
+</ResponseField>
+
+## ViabilityReport
+
+Returned by `assessViability()` and embedded in `PredictionResult.viability`. Explains exactly why `auto` mode chose matrix or fell back to single.
+
+<ResponseField name="viable" type="boolean">
+  Whether the author matrix passed all viability criteria. `false` → `auto` falls back to single mode.
+</ResponseField>
+
+<ResponseField name="channels" type="number">
+  Total number of distinct channels in the current event table.
+</ResponseField>
+
+<ResponseField name="maxSharedEvents" type="number">
+  The maximum number of shared events found between any channel pair. Compared against `minSharedEvents`.
+</ResponseField>
+
+<ResponseField name="strongEdges" type="number">
+  Number of directed lag edges whose `peakShare ≥ minPeakShare`. Compared against `minStrongEdges`.
+</ResponseField>
+
+<ResponseField name="multiChannelClusters" type="number">
+  Number of author clusters that contain more than one channel (confirmed sibling pairs).
+</ResponseField>
+
+<ResponseField name="clusterCount" type="number">
+  Total number of distinct author clusters found. Compared against `minStructure` when `multiChannelClusters === 0`.
+</ResponseField>
+
+<ResponseField name="reason" type="string">
+  Human-readable explanation of why the viability verdict was reached. Examples: `"auto → matrix: 3 strong edges, overlap 5, clusters >1: 2"` or `"auto → single: мало общих событий (макс 2 < 3) — перекрытие шумовое"`.
+</ResponseField>
+
+## ReliabilityConfig
+
+Thresholds that control when the model is considered reliably trained. Configurable via `TrainOptions.reliability`.
+
+```typescript
+interface ReliabilityConfig {
+  supportK: number;             // default 30
+  confidenceThreshold: number;  // default 0.6
+  minN: number;                 // default 40
+}
+
+const DEFAULT_RELIABILITY: ReliabilityConfig = {
+  supportK: 30,
+  confidenceThreshold: 0.6,
+  minN: 40,
+};
+```
+
+<ResponseField name="supportK" type="number">
+  Shrinkage parameter for the support score: `support = N / (N + supportK)`. At `N = supportK` the support contribution is exactly 0.5. Higher values demand more trades before the model is considered well-supported. Default `30`.
+</ResponseField>
+
+<ResponseField name="confidenceThreshold" type="number">
+  The minimum `confidence` score (product of `support × stability × significance`, each in `[0, 1]`) required for `reliable` to be `true`. Default `0.6`.
+</ResponseField>
+
+<ResponseField name="minN" type="number">
+  The minimum total number of labeled trades across all folds for `reliable` to be `true`, regardless of the confidence score. Prevents a high-confidence result on a trivially small sample. Default `40`.
+</ResponseField>
+
+The computed `Reliability` object carries the individual axis scores:
+
+<ResponseField name="confidence" type="number">
+  Overall trust score in `[0, 1]`: `support × stability × significance`.
+</ResponseField>
+
+<ResponseField name="reliable" type="boolean">
+  `true` when `confidence ≥ confidenceThreshold` AND `totalN ≥ minN`.
+</ResponseField>
+
+<ResponseField name="support" type="number">
+  Volume axis: `N / (N + supportK)`. Grows from 0 toward 1 as more trades are seen.
+</ResponseField>
+
+<ResponseField name="stability" type="number">
+  Fold-consistency axis: fraction of folds with a positive mean return, weighted by low coefficient of variation across folds.
+</ResponseField>
+
+<ResponseField name="significance" type="number">
+  Statistical-significance axis: how many standard errors the mean return is above zero, passed through a saturating sigmoid.
+</ResponseField>
+
+<ResponseField name="totalN" type="number">
+  Total number of labeled trades summed across all folds.
+</ResponseField>
+
+## Certification
+
+The statistical certificate produced by `certifyStrategy()` and accessible on the model via `model.certification`. `certified: true` only when the selected configuration's edge survives all five barriers simultaneously. `certified: false` means the model **should not trade** — the evidence suggests the edge is a brute-force search artifact rather than a real repeatable pattern.
+
+```typescript
+interface Certification {
+  certified: boolean;
+  dsr: number;
+  pbo: number;
+  spaPValue: number;
+  minTRL: number;
+  actualN: number;
+  nestedScore: number | null;
+  reasons: string[];
+}
+```
+
+<ResponseField name="certified" type="boolean">
+  `true` only if all five barriers pass. `false` with `reasons[]` populated explains specifically which barriers failed.
+</ResponseField>
+
+<ResponseField name="dsr" type="number">
+  Deflated Sharpe Ratio (López de Prado 2014). Probability that the true Sharpe exceeds the expected-maximum Sharpe of a random search over `N` trials, adjusted for skewness, kurtosis, and sample length. Must be ≥ 0.95 to pass.
+</ResponseField>
+
+<ResponseField name="pbo" type="number">
+  Probability of Backtest Overfitting via Combinatorially-Symmetric CV (CSCV). Fraction of IS/OOS splits where the in-sample-best configuration fell in the bottom half of out-of-sample ranks. → 0.5 = pure overfit; → 0 = edge transfers OOS. Must be ≤ 0.10 to pass.
+</ResponseField>
+
+<ResponseField name="spaPValue" type="number">
+  White's Reality Check / Hansen SPA p-value (stationary bootstrap). H₀: the best strategy's edge is entirely explained by data-snooping across all candidate configurations. Must be ≤ 0.05 to pass (reject H₀).
+</ResponseField>
+
+<ResponseField name="minTRL" type="number">
+  Minimum Track Record Length — the minimum number of trades required for the observed Sharpe to be statistically significant at α = 0.05. Acts as a physical-feasibility gate: if `actualN < minTRL`, the sample is too small for any conclusion.
+</ResponseField>
+
+<ResponseField name="actualN" type="number">
+  The actual number of trades in the selected configuration's return series. Must be ≥ `minTRL` to pass.
+</ResponseField>
+
+<ResponseField name="nestedScore" type="number | null">
+  The unbiased out-of-sample estimate from nested cross-validation. `null` if nested CV was not run (`selection.nestedOuterFolds = 0`). Must be > 0 to pass when present.
+</ResponseField>
+
+<ResponseField name="reasons" type="string[]">
+  Human-readable list of barrier failures. Empty when `certified: true`. Example: `["DSR 0.71 < 0.95 (N-trial correction failed)", "actualN 28 < minTRL 34"]`.
+</ResponseField>
+
+## PredictionResult
+
+The full output of the low-level `predict()` function and `model.explain()`.
+
+<ResponseField name="signals" type="PumpVerdict[]">
+  Only verdicts with `action = "open"`, sorted by `confidence` descending. These are the candidates that passed all detector filters.
+</ResponseField>
+
+<ResponseField name="verdicts" type="PumpVerdict[]">
+  All verdicts for every `(symbol, direction)` evaluated, including those with `action = "skip"`.
+</ResponseField>
+
+<ResponseField name="authors" type="AuthorMap">
+  A `Map<string, number>` of channel → author-cluster id, representing the merging of channels belonging to the same operator.
+</ResponseField>
+
+<ResponseField name="authorCount" type="number">
+  Number of independent author clusters identified in the current burst window.
+</ResponseField>
+
+<ResponseField name="tauMs" type="number">
+  The self-tuned characteristic lag τ between sibling channels, in milliseconds. Derived from the histogram of pairwise delays; clamped to `[30s, 60min]`. Defaults to 15 minutes when data is insufficient.
+</ResponseField>
+
+<ResponseField name="windowMs" type="number">
+  The effective burst synchrony window (`windowK × τ`, capped at `maxBurstWindowMs`).
+</ResponseField>
+
+<ResponseField name="usedMode" type='"matrix" | "single"'>
+  The mode that actually ran for this prediction (`"auto"` resolves to one of the two concrete modes).
+</ResponseField>
+
+<ResponseField name="viability" type="ViabilityReport">
+  Full viability assessment explaining why `auto` chose matrix or single. See [ViabilityReport](#viabilityreport).
+</ResponseField>
+
+## ExitParams and ReplayResult
+
+### ExitParams
+
+The complete set of exit parameters for a single position. Stored in the exit tensor and resolved hierarchically per signal. Every field is a training-time decision, not a runtime heuristic.
+
+<ResponseField name="trailingTake" type="number">
+  Trailing-take pullback threshold as a percentage of peak PnL. Once `currentProfit ≥ 0`, a pullback of this % from the peak triggers an exit. Already tightened (multiplied by `tightenFactor`) when `squeezePolicy = "tighten"`.
+</ResponseField>
+
+<ResponseField name="hardStop" type="number">
+  Fixed hard-stop percentage from the entry price against the position direction. Long: below entry; short: above entry. When triggered, the realized PnL is the honest `−hardStop%` loss.
+</ResponseField>
+
+<ResponseField name="stalenessSinceProfit" type="number">
+  Profit percentage threshold that arms the peak-staleness exit. The staleness timer only activates once the position reaches at least this profit.
+</ResponseField>
+
+<ResponseField name="stalenessSinceMinutes" type="number">
+  Number of minutes without a new peak PnL high, after `stalenessSinceProfit` is reached, before the staleness exit fires.
+</ResponseField>
+
+<ResponseField name="staleMinutes" type="number">
+  Hard ceiling on position lifetime in minutes — the empirical impact horizon of a single post. The position is force-closed at the close of the last candle in this window. Trained by the grid; varies significantly by asset (e.g. 30 min for HYPE vs. 48h+ for BTC).
+</ResponseField>
+
+<ResponseField name="volBaselineWindow" type="number" optional>
+  Number of candles before the entry candle used as the volume baseline for `volZ`. If absent, `volZ` is not computed (no volume regime classification).
+</ResponseField>
+
+<ResponseField name="volZThreshold" type="number" optional>
+  The z-score threshold separating `"calm"` from `"anomalous"` volume regime. Trained by grid.
+</ResponseField>
+
+<ResponseField name="squeezePolicy" type='"none" | "tighten" | "veto" | "invert" | "ignore"' optional>
+  Reaction when `squeezePressure ≥ squeezeThreshold`: `none` = normal entry; `tighten` = tighten trailing take; `veto` = skip the signal entirely; `invert` = enter opposite to the channel's direction; `ignore` = enter in the original direction despite the cascade (produces the counterfactual "what if we ignore the cascade" pnl).
+</ResponseField>
+
+<ResponseField name="squeezeThreshold" type="number" optional>
+  The `squeezePressure` fraction (0–1) that triggers `squeezePolicy`. Trained by grid.
+</ResponseField>
+
+<ResponseField name="tightenFactor" type="number" optional>
+  Multiplier applied to `trailingTake` when `squeezePolicy = "tighten"`. Default `0.5` (trailing halved).
+</ResponseField>
+
+<ResponseField name="cascadeWindowMinutes" type="number" optional>
+  Minutes over which `squeezePressure` is measured — the cascade-detection window. Independent of `staleMinutes` because a squeeze is a fast event (minutes), not the full position lifetime. Falls back to `staleMinutes` for backward compatibility when unset.
+</ResponseField>
+
+### ReplayResult
+
+The output of `replayExit()` — the realized outcome of simulating the exit strategy on a sequence of 1-minute candles. Also embedded in `BacktestResult` (returned by `model.backtest()`).
+
+<ResponseField name="pnl" type="number">
+  Realized PnL as a fraction (e.g. `0.05` = +5%). At a hard-stop this is the honest `−hardStop%` loss — not a fictitious peak rollback.
+</ResponseField>
+
+<ResponseField name="reason" type="ExitReason">
+  Why the position was closed: `"trailing-take"`, `"hard-stop"`, `"peak-staleness"`, `"life-cap"`, `"cascade-veto"`, `"invert"`, or `"no-entry"`.
+</ResponseField>
+
+<ResponseField name="peak" type="number">
+  Peak PnL reached at any point during the position's life, as a fraction. Kept for diagnostics; does not affect the realized `pnl`.
+</ResponseField>
+
+<ResponseField name="heldMinutes" type="number">
+  Number of minutes from entry to exit.
+</ResponseField>
+
+<ResponseField name="entered" type="boolean">
+  Whether the position was actually opened. `false` when the entry zone was never touched within the candle window.
+</ResponseField>
+
+<ResponseField name="entryPrice" type="number">
+  The price at which entry was taken. `0` if not entered.
+</ResponseField>
+
+<ResponseField name="exitPrice" type="number">
+  The price at which the position was closed. `0` if not entered.
+</ResponseField>
+
+<ResponseField name="volZ" type="number">
+  Z-score of the entry candle's volume against the baseline window. High values indicate the crowd synchronously entered on leverage (fuel accumulated for a potential cascade).
+</ResponseField>
+
+<ResponseField name="squeezePressure" type="number">
+  Fraction of volume in the detection window on candles where price moved against the position direction. For long: bearish candles; for short: bullish candles. High values indicate a liquidation cascade rather than honest directional flow.
+</ResponseField>
+
+<ResponseField name="volRegime" type='"calm" | "anomalous"'>
+  Volume regime at entry: `"calm"` if `volZ < volZThreshold`; `"anomalous"` if above. Determines which exit-tensor cell is used.
+</ResponseField>
+
+<ResponseField name="inverted" type="boolean">
+  Whether the position direction was inverted by `squeezePolicy = "invert"`.
+</ResponseField>
+
+<ResponseField name="truncated" type="boolean">
+  `true` when there were not enough candles after entry to cover the full `staleMinutes` life-cap. Truncated results are dropped per-exit during training to prevent a 1-hour horizon being compared against a 24-hour one on a clipped path.
+</ResponseField>
+
+<Note>
+  For the high-level API — `PumpMatrix.fit()`, `plan()`, `backtest()`, and `signals()` — see the PumpMatrix API reference. For the input contract, see [ParserItem](/api/parser-item) and [GetCandles](/api/get-candles).
+</Note>

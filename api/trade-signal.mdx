@@ -1,0 +1,260 @@
+---
+title: "TradeSignal and BacktestSignal Type Reference"
+sidebarTitle: "TradeSignal"
+description: "Complete field reference for TradeSignal, BacktestSignal, BacktestResult, ExitPlan, and SignalOrigin — the output types of plan(), signals(), and backtest()."
+---
+
+Every execution method in `PumpMatrix` produces a `TradeSignal` — a single, flat, immediately actionable object. The design principle is that production code reads the flat executable fields (`symbol`, `direction`, `exit`) and calls `openPosition` without branching. Provenance, audit information, and detector metadata live in the nested `origin` object, which is for logging and tracing, not for conditional logic.
+
+`backtest()` and `planForAt()` extend this contract with a `result` field containing the realized PnL from a forward replay of the exit plan over closed historical candles.
+
+<Note>
+  `plan()` and `signals()` return `TradeSignal` — no `result` field, because the position has not closed yet. `backtest()` and `planForAt()` return `BacktestSignal`, which extends `TradeSignal` with `result: BacktestResult`.
+</Note>
+
+---
+
+## TradeSignal
+
+The unified executable output of `signals()` and `plan()`. One signal equals one decision. The `direction` field is always the final executable direction — inversion has already been applied when `action === "invert"`.
+
+```typescript
+interface TradeSignal {
+  symbol:          string;
+  direction:       "long" | "short";
+  action:          "enter" | "invert" | "tighten";
+  ts:              number;
+  entryFromPrice?: number;
+  entryToPrice?:   number;
+  exit:            ExitPlan;
+  origin:          SignalOrigin;
+}
+```
+
+<ResponseField name="symbol" type="string" required>
+  Trading pair ticker, e.g. `"SOLUSDT"`, `"BTCUSDT"`. Passed through from the source `ParserItem`.
+</ResponseField>
+
+<ResponseField name="direction" type='"long" | "short"' required>
+  **Final** executable direction. If the cascade detector fired `squeezePolicy: "invert"`, this field already contains the flipped direction — the original channel direction is preserved in `origin.invertedFrom`. Production code always executes `direction` without checking for inversion.
+</ResponseField>
+
+<ResponseField name="action" type='"enter" | "invert" | "tighten"' required>
+  The single discriminator for this signal's character. See the [Action Values](#action-values) section for full semantics.
+</ResponseField>
+
+<ResponseField name="ts" type="number" required>
+  Signal timestamp in Unix milliseconds. For a matrix burst, this is the timestamp of the burst itself; for single mode, it is the post publication timestamp.
+</ResponseField>
+
+<ResponseField name="entryFromPrice" type="number">
+  Lower bound of the entry zone from the source `ParserItem`. If `undefined`, enter at market (open of the first candle). Used by `backtest()` and `planForAt()` as the lower bound for the entry-zone scan.
+</ResponseField>
+
+<ResponseField name="entryToPrice" type="number">
+  Upper bound of the entry zone from the source `ParserItem`. If `undefined` (or equal to `entryFromPrice`), the zone collapses to a single price point. Pairs with `entryFromPrice` to define the live order range.
+</ResponseField>
+
+<ResponseField name="exit" type="ExitPlan" required>
+  Flat, ready-to-use exit plan. All fields are absolute values suitable for passing directly to `openPosition`. See [ExitPlan](#exitplan) below.
+</ResponseField>
+
+<ResponseField name="origin" type="SignalOrigin" required>
+  Provenance object for audit and tracing. Not intended for production branching — all branching decisions are already reflected in `direction`, `action`, and `exit`. See [SignalOrigin](#signalorigin) below.
+</ResponseField>
+
+---
+
+## ExitPlan
+
+The flat executable exit plan embedded in every `TradeSignal`. All five fields are required and immediately usable by your position management code. When `action === "tighten"`, `trailingTake` is already reduced by the trained `tightenFactor` (default `0.5`).
+
+```typescript
+interface ExitPlan {
+  trailingTake:           number;
+  hardStop:               number;
+  impactHorizonMinutes:   number;
+  stalenessSinceProfit:   number;
+  stalenessSinceMinutes:  number;
+}
+```
+
+<ResponseField name="trailingTake" type="number" required>
+  Trailing take percentage — the maximum pullback from the peak PnL that triggers an exit. Measured from peak once `currentProfit >= 0`. If `action === "tighten"`, this value is already multiplied by `tightenFactor` (typically halved) to exit before the reversal. Unit: percent (e.g. `1.5` = 1.5%).
+</ResponseField>
+
+<ResponseField name="hardStop" type="number" required>
+  Hard stop percentage — a fixed loss threshold from the entry price that immediately closes the position. For a long, this fires when price falls `hardStop%` below entry; for a short, when it rises `hardStop%` above. Unit: percent. The realized PnL on a hard-stop exit is the honest `-hardStop%` loss — the library never rolls back to the last positive peak on a stop-out.
+</ResponseField>
+
+<ResponseField name="impactHorizonMinutes" type="number" required>
+  Maximum position lifetime in minutes — the empirical impact horizon of the channel signal. The position is closed at the life-cap regardless of current PnL. Corresponds to `staleMinutes` in the training grid; tuned by cross-validation, not hardcoded. Exits at the close of the last candle in the window.
+</ResponseField>
+
+<ResponseField name="stalenessSinceProfit" type="number" required>
+  Peak-staleness profit threshold. The staleness timer is only **armed** once the peak PnL has reached this percentage. Below this threshold the position is not considered stale regardless of how long it has been open. Unit: percent (e.g. `1.0` = 1%).
+</ResponseField>
+
+<ResponseField name="stalenessSinceMinutes" type="number" required>
+  Peak-staleness window in minutes. Once the peak has exceeded `stalenessSinceProfit`, if the position goes this many minutes without registering a new peak (price stagnates below the previous high), it exits — even if the hard stop and trailing take have not fired. Captures slow-decay situations where the momentum has died but price never quite reverses hard enough to hit the trailing take.
+</ResponseField>
+
+---
+
+## SignalOrigin
+
+The provenance record embedded in every `TradeSignal`. Fields here describe **where** the signal came from and **how** the exit was resolved. This object is for auditing, tracing signals back to source posts, and debugging — not for branching in production code.
+
+```typescript
+interface SignalOrigin {
+  detector:            "matrix" | "single";
+  channel:             string | null;
+  invertedFrom:        "long" | "short" | null;
+  exitSource:          "cell" | "symbol-dir" | "mode" | "global";
+  volRegime:           "calm" | "anomalous" | null;
+  confidence:          number;
+  independentClusters: number;
+  modelConfidence:     number;
+  modelReliable:       boolean;
+  id?:                 string;
+  ids?:                string[];
+}
+```
+
+<ResponseField name="detector" type='"matrix" | "single"' required>
+  Which detection mode produced this signal. `"matrix"` means the signal came from a synchronized burst across ≥ 2 independent author clusters. `"single"` means the signal came from a single channel post (single-channel fallback mode).
+</ResponseField>
+
+<ResponseField name="channel" type="string | null" required>
+  Source channel name for single-mode signals. `null` for matrix-mode signals, which are cross-channel by definition (no single owner).
+</ResponseField>
+
+<ResponseField name="invertedFrom" type='"long" | "short" | null' required>
+  If this signal was inverted (the cascade detector fired `squeezePolicy: "invert"`), this field holds the **original** channel direction. The signal's `direction` is already the flipped direction. `null` means no inversion occurred. This is not a duplicate of `direction` — `direction` is what to execute, `invertedFrom` is what the channel said.
+</ResponseField>
+
+<ResponseField name="exitSource" type='"cell" | "symbol-dir" | "mode" | "global"' required>
+  The level of the exit tensor from which the `exit` plan was resolved. The tensor uses hierarchical fallback:
+  - `"cell"` — exact match for `[mode][channel][symbol][direction][volRegime]`
+  - `"symbol-dir"` — collapsed across `volRegime`; `[mode][symbol][direction]`
+  - `"mode"` — collapsed across channel, symbol, and direction
+  - `"global"` — root fallback, trained across all data
+
+  Use this to understand whether the exit was specifically tuned for this channel/symbol/direction combination or is a generic fallback.
+</ResponseField>
+
+<ResponseField name="volRegime" type='"calm" | "anomalous" | null' required>
+  Volume regime detected at entry. `"anomalous"` means the entry candle's volume z-score exceeded the trained `volZThreshold` — the crowd entered on leverage (fuel accumulated). `"calm"` means normal volume. `null` when called via `signals()` (no candles provided) or when candle data was unavailable.
+</ResponseField>
+
+<ResponseField name="confidence" type="number" required>
+  Burst sharpness score from the detector, in `[0, 1]`. For matrix mode: `(clusters / channels) × (saturation relative to minClusters × 2)`. For single mode: a fixed baseline value. Higher means more independent sources converged clearly.
+</ResponseField>
+
+<ResponseField name="independentClusters" type="number" required>
+  Number of independent author clusters that contributed to this signal. Always `1` in single mode. In matrix mode, this is the count of deduplicated clusters (echo channels from the same author collapse to one cluster).
+</ResponseField>
+
+<ResponseField name="modelConfidence" type="number" required>
+  The model's training-time `confidence` score (0..1) — carried from `model.confidence`. Reflects how much data was available and how stable and significant the edge was during training.
+</ResponseField>
+
+<ResponseField name="modelReliable" type="boolean" required>
+  The model's training-time `reliable` flag — carried from `model.reliable`. `false` means the model is operating with insufficient training data and its signals should be treated cautiously.
+</ResponseField>
+
+<ResponseField name="id" type="string">
+  The `id` of the anchor `ParserItem` that created this signal — normalized to a string even if the original was a number. Useful for tracing a live signal back to the exact source post. `undefined` if the `ParserItem` had no `id`.
+</ResponseField>
+
+<ResponseField name="ids" type="string[]">
+  All `ParserItem` ids that were folded into this signal burst. In matrix mode a burst may include multiple posts; `ids` contains all of them. In single mode, typically a one-element array matching `id`.
+</ResponseField>
+
+---
+
+## BacktestSignal
+
+`BacktestSignal` is the output type of `backtest()` and `planForAt()`. It extends `TradeSignal` with a `result` field containing the realized outcome of replaying the exit plan forward over closed historical candles.
+
+```typescript
+interface BacktestSignal extends TradeSignal {
+  result: BacktestResult;
+}
+```
+
+The replay uses the signal's **final** direction (inversion already applied), its resolved `exit` plan, and the entry zone from the source `ParserItem` (`entryFromPrice` / `entryToPrice`), falling back to the first candle's open if no zone is specified. The replay is path-aware: it sees the full OHLC path, not just open and close, so a wick into a stop-hunt trap produces a negative PnL even if the candle ultimately closes positive.
+
+---
+
+## BacktestResult
+
+The realized result of replaying the exit plan forward. Only present on `BacktestSignal` — `plan()` and `signals()` do not carry this field because the position is still open.
+
+```typescript
+interface BacktestResult {
+  entered:      boolean;
+  pnl:          number;
+  peak:         number;
+  reason:       string;
+  heldMinutes:  number;
+  entryPrice:   number;
+  exitPrice:    number;
+  truncated:    boolean;
+}
+```
+
+<ResponseField name="entered" type="boolean" required>
+  Whether the replay found an entry. `false` if the entry zone was never touched on the candle window (the price never reached `entryFromPrice`..`entryToPrice`). When `false`, all price and PnL fields are `0`.
+</ResponseField>
+
+<ResponseField name="pnl" type="number" required>
+  Realized PnL as a fraction — e.g. `0.05` = +5%, `-0.02` = −2%. For a hard-stop exit, this is the honest `-hardStop%` loss. The peak is tracked separately; the PnL is the actual realized value, never rolled back to the last positive peak on a stop-out.
+</ResponseField>
+
+<ResponseField name="peak" type="number" required>
+  Peak PnL over the position's lifetime as a fraction. Always ≥ 0 when entered. Useful for computing trailing-take efficiency — how close the actual exit was to the theoretical maximum.
+</ResponseField>
+
+<ResponseField name="reason" type="string" required>
+  Why the position was closed. Values from the simulation:
+  - `"hard-stop"` — price hit the hard stop threshold
+  - `"trailing-take"` — pullback from peak exceeded `trailingTake`
+  - `"peak-staleness"` — position went stale after peak profit threshold was reached
+  - `"life-cap"` — impact horizon expired
+  - `"no-candles"` — no candle data was available (entered is false)
+</ResponseField>
+
+<ResponseField name="heldMinutes" type="number" required>
+  Minutes from entry to exit. `0` if not entered.
+</ResponseField>
+
+<ResponseField name="entryPrice" type="number" required>
+  Actual entry price. For entry within a zone, this is the candle `close` if it falls in `[entryFrom, entryTo]`, otherwise the clamped midpoint of the entry zone to `[low, high]`. `0` if not entered.
+</ResponseField>
+
+<ResponseField name="exitPrice" type="number" required>
+  Price at which the position was closed (producing the realized `pnl`). `0` if not entered.
+</ResponseField>
+
+<ResponseField name="truncated" type="boolean" required>
+  `true` if there were not enough candles after entry to cover the full `impactHorizonMinutes`. A truncated measurement is kept in the output (unlike during training, where truncated entered trades are dropped to avoid comparing a 24h horizon against a 1h one). Check this flag if `reason` is `"life-cap"` and `heldMinutes` seems shorter than expected.
+</ResponseField>
+
+---
+
+## Action Values
+
+The `action` field is the only discriminator needed to understand a signal's character. Production code typically branches on `action` only to apply routing logic — the `direction` and `exit` are always already correct.
+
+### `"enter"`
+
+A standard entry in the direction the channel posted. The cascade detector either was not active (no candles), found no anomaly, or found an anomaly with `squeezePolicy: "none"` or `"ignore"`. Open a position in `direction` with `exit`.
+
+### `"invert"`
+
+The cascade detector fired and `squeezePolicy: "invert"` was selected. The crowd entered in one direction, accumulated leverage, and is now vulnerable to a liquidation cascade. The signal flips the direction to trade **against** the channel post — enter in `direction` (already flipped), which is the opposite of what the channel said. `origin.invertedFrom` records the channel's original direction for audit purposes.
+
+### `"tighten"`
+
+The cascade detector fired and `squeezePolicy: "tighten"` was selected. Enter in the same direction as the channel posted, but with a tighter trailing take — `exit.trailingTake` is already reduced by the trained `tightenFactor` (default 0.5×). The tighter trail exits the position earlier, before the expected reversal from the cascade consumes the gains.

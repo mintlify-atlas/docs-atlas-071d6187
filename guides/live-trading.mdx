@@ -1,0 +1,144 @@
+---
+title: "Execute Live Crypto Trades with pump-anomaly plan()"
+sidebarTitle: "Live Trading"
+description: "Use model.plan() for look-ahead-free live trade signals with liquidation-cascade detection based on candles strictly before the signal."
+---
+
+When running pump-anomaly in production you need signals that are safe to act on immediately — no peeking at candles that haven't closed yet, no manual veto logic, no inversion flags to interpret. `plan()` is the live execution method: it fetches 1 m candles **strictly before** the signal, evaluates the liquidation-cascade detector on that past window, and returns a flat list of `TradeSignal` objects that your order router can execute without any additional decision logic.
+
+## Three Execution Methods
+
+The three methods differ only in which candles they are allowed to see and what they return:
+
+| Method | Candles | Use |
+|---|---|---|
+| `signals(items, policy?)` | none | Fast path; cascade not evaluated; every outcome is `enter` |
+| `plan(items, source, policy?)` | **before** the signal (live-safe, no look-ahead) | Live decision |
+| `backtest(items, source, policy?)` | **after** the signal (forward replay) | Replay over closed history |
+
+`plan` and `backtest` each accept either a `GetCandles` function (async, returns a `Promise`) or a `{ symbol: candles }` map (sync, returns `TradeSignal[]` directly).
+
+## plan() in Detail
+
+The look-ahead guarantee comes from `squeezePressureBefore`, which measures cascade pressure only over candles with timestamps **before** the entry candle. `plan()` requests exactly `lookbackMinutes` of 1 m history ending at the signal minute — it never requests a candle whose open time is at or after the entry start.
+
+Internally, `plan()` computes `entryStartTs(signal.ts, "1m")` to find the first fully-closed tradeable candle, then pulls `[entryStart − lookback · 60 000, entryStart)` from your candle source. No forward candle is ever fetched or examined.
+
+```typescript
+// async — pass the same getCandles function used during training
+const trades = await model.plan(liveItems, getCandles);
+
+// sync — pass a preloaded { symbol: candles } map (candles must be BEFORE the signal)
+const trades = model.plan(liveItems, { SOLUSDT: candleArray });
+```
+
+Both overloads apply the same cascade detector and return the same `TradeSignal[]` shape. The async overload is for prod systems with a live exchange adapter; the sync overload is useful in tests or when you prefetch candles yourself.
+
+## TradeSignal Contract
+
+Every element returned by `plan()` (and `signals()`) is a single executable decision. The flat execution fields are always valid; the `origin` object is for audit only — production code should never branch on it.
+
+```typescript
+interface TradeSignal {
+  symbol: string;
+  direction: "long" | "short";       // FINAL — inversion already applied
+  action: "enter" | "invert" | "tighten";
+  ts: number;                         // signal time, unix ms
+
+  entryFromPrice?: number;            // lower bound of entry zone (undefined → market)
+  entryToPrice?: number;              // upper bound of entry zone
+
+  exit: {
+    trailingTake: number;             // trailing take %, already tightened if action="tighten"
+    hardStop: number;                 // hard stop % from entry
+    impactHorizonMinutes: number;     // empirical position life ceiling
+    stalenessSinceProfit: number;     // peak-staleness: profit threshold % that arms the timer
+    stalenessSinceMinutes: number;    // peak-staleness: minutes without a new high → exit
+  };
+
+  origin: {
+    detector: "matrix" | "single";   // which detector produced this signal
+    channel: string | null;           // source channel (null for matrix signals)
+    invertedFrom: "long" | "short" | null;  // original channel direction (null = no inversion)
+    exitSource: "cell" | "symbol-dir" | "mode" | "global"; // exit tensor resolution level
+    volRegime: "calm" | "anomalous" | null; // volume regime at entry
+    confidence: number;               // burst sharpness from the detector
+    independentClusters: number;      // independent author clusters that agreed
+    modelConfidence: number;          // model-level confidence (0..1) from training
+    modelReliable: boolean;           // did training have enough stable data
+    id?: string;                      // anchor parser-item id for traceback
+    ids?: string[];                   // all parser-item ids folded into this signal
+  };
+}
+```
+
+`direction` is always the **final** direction. When `action` is `"invert"`, the channel posted short but the cascade detector flipped it to long — your order router still just executes `s.direction`. `origin.invertedFrom` tells you what the channel said, for logging.
+
+## Execution Pattern
+
+The intended production loop is exactly one statement per signal:
+
+```typescript
+for (const s of trades) {
+  openPosition(
+    s.symbol,
+    s.direction,
+    { from: s.entryFromPrice, to: s.entryToPrice },
+    s.exit,
+  );
+}
+```
+
+`s.direction` is ready. `s.exit` is ready. `s.entryFromPrice` / `s.entryToPrice` come directly from the `ParserItem`; if absent, enter at market. There are no flags to evaluate before calling `openPosition`.
+
+## lookbackMinutes
+
+`model.lookbackMinutes` tells you exactly how much 1 m candle history `plan()` needs per signal:
+
+```
+lookbackMinutes = max(volBaselineWindow, cascadeWindowMinutes) + 5
+```
+
+The extra 5 candles are a safety buffer against boundary gaps. In production, keep at least `model.lookbackMinutes` minutes of 1 m history available for every symbol that may appear in a fresh signal. If the candle source returns nothing for a symbol (data gap, unlisted pair), `plan()` degrades gracefully to a no-candle signal rather than crashing the whole call.
+
+```typescript
+console.log(model.lookbackMinutes); // e.g. 35 for a typical config
+```
+
+## planFor() for Single Positions
+
+When you need a one-off live signal for a single position rather than a batch, use `planFor()`:
+
+```typescript
+planFor(
+  symbol: string,
+  direction: "long" | "short",
+  channel: string | null,
+  candles: ICandleData[],          // pre-signal candles you provide
+  policy?: Partial<SignalPolicy>,
+): TradeSignal | null              // null if vetoed or action not in allow-list
+```
+
+`planFor()` constructs a synthetic verdict from the last candle's timestamp and runs the same live-mode cascade check. It returns `null` if the result is vetoed or the resulting action is excluded by the policy. Use it for manual entries or external signal sources that aren't `ParserItem[]`.
+
+## Risk-Reward Filter
+
+The runtime policy can filter out symbols whose backtested risk-reward ratio falls below a threshold. This filter is **read-only**: it can only narrow what training already permitted.
+
+```typescript
+// keep only symbols where mean backtest RR >= 1.5
+model.signals(items, { minRiskReward: 1.5 });
+
+// filter by the P99 tail — keeps symbols with explosive upside
+model.signals(items, { minRiskReward: 5.0, rrMetric: "p99" });
+```
+
+`rrMetric` selects which statistic to compare: `"mean"` (default), `"p95"`, or `"p99"`. A symbol with no RR statistics is cut conservatively — nothing to confirm it with. A runtime `minRiskReward` can only tighten the baked-in threshold (the max of the two is used), never loosen it.
+
+<Warning>
+  Veto signals are filtered internally and **never appear** in the output of `signals()`, `plan()`, or `backtest()`. Production code should never contain `if (signal.action === "veto")` checks — that action does not exist in the `TradeSignal` type. When the cascade detector fires `squeezePolicy = "veto"`, the signal is silently dropped before it reaches your code.
+</Warning>
+
+<Note>
+  A broken symbol — data gap, unlisted pair, look-ahead guard at the end of history — causes `plan()` to degrade gracefully to a no-candle signal (cascade not evaluated, `volRegime: null`) instead of throwing and aborting the whole batch. The rest of the signals in the batch are unaffected.
+</Note>

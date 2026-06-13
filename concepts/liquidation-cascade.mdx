@@ -1,0 +1,171 @@
+---
+title: "Liquidation Cascade Detection: Symmetric Long/Short Stop Hunting"
+sidebarTitle: "Liquidation Cascade"
+description: "How pump-anomaly detects stop-hunting traps using volume z-scores and squeeze pressure, and the four cascade policy reactions: none, tighten, veto, invert."
+---
+
+Stop hunting is a deliberate price manipulation where large players push the market just far enough to trigger a wall of leveraged stop orders. The crowd, entering on a Telegram signal, becomes the fuel. `pump-anomaly` detects this trap using two volume-based metrics and reacts according to a trained policy — tightening the exit, vetoing entry entirely, or even inverting the trade direction to capture the cascade itself.
+
+---
+
+## The Mechanism
+
+The cascade is symmetric. Both directions are mirrors of the same mechanism:
+
+**Short squeeze** — the crowd shorts on leverage. A wall of liquidation orders accumulates above the current price. A large buyer pushes through that wall, triggering a cascade of forced buy orders that rocket the price upward — directly against the short position.
+
+**Long cascade** — the crowd longs on leverage. A wall of liquidation orders accumulates below the current price. A large seller pushes through that wall, triggering a cascade of forced sell orders that crush the price downward — directly against the long position.
+
+In both cases the signal (the Telegram post) is the bait. The channel tells you to go long (or short), you enter on leverage, and the cascade wipes you out. The mechanism is identical; only the direction flips. `pump-anomaly` uses a single symmetric formula for both.
+
+---
+
+## Detection Metrics
+
+Two metrics characterize a cascade. Both are computed from 1m candle data.
+
+| Metric | What it measures | How |
+|---|---|---|
+| `volZ` | Z-score of the entry candle's volume against the baseline window before entry | `volumeZScore(candles, entryIdx, baselineWindow)` |
+| `squeezePressure` | Share of volume on candles where price moves **against** the position | Symmetric: "against" = down for long, up for short |
+
+**`volZ`** captures the moment the crowd piles in on leverage — the anomalous "blue candle" that feeds the liquidation wall. A high z-score means synchronized leveraged entry. It also determines the `volRegime` (`calm` vs `anomalous`) used when resolving the exit cell in the tensor.
+
+**`squeezePressure`** captures what happens next. If the volume that follows entry is concentrated on candles where price moves against your position, the move is being fed by forced liquidations — not by honest flow. That is the signature of a trap.
+
+```ts
+import { volumeZScore, squeezePressure, volumeFeatures, volRegimeOf } from "pump-anomaly";
+
+const volZ = volumeZScore(candles, entryIdx, baselineWindow);
+const regime = volRegimeOf(volZ, volZThreshold);  // "calm" | "anomalous"
+
+const pressure = squeezePressure(candles, entryIdx, "long", cascadeWindowMinutes);
+
+// or both at once:
+const { volZ, squeezePressure } = volumeFeatures(
+  candles, entryIdx, "long", baselineWindow, cascadeWindowMinutes
+);
+```
+
+---
+
+## Live vs Backtest Detection
+
+The two inference paths measure `squeezePressure` from different candles to maintain the look-ahead guarantee.
+
+**Backtest (`backtest()` / `planForAt()`):** `squeezePressure` is measured over candles *after* the entry candle, looking forward into the cascade window. This is a post-hoc measurement — the history is already closed, so no look-ahead constraint applies.
+
+**Live (`plan()` / `planFor()`):** Candles after the signal don't exist yet. Instead, `squeezePressureBefore` measures the share of against-position volume over candles *strictly before* the entry candle. A market that was already under cascade pressure before the signal is suspicious — the trap may already be in motion.
+
+```ts
+// live path uses squeezePressureBefore:
+// candles in window [entryIdx - horizon, entryIdx)  — no look-ahead
+
+// backtest path uses squeezePressure:
+// candles in window [entryIdx + 1, entryIdx + horizon]
+```
+
+`model.lookbackMinutes` tells you how many minutes of pre-signal 1m candle history `plan()` needs per signal:
+
+```ts
+// lookbackMinutes = max(volBaselineWindow, cascadeWindowMinutes) + 5
+model.lookbackMinutes; // keep at least this much history available in prod
+```
+
+---
+
+## Policy Reactions
+
+When `volZ >= volZThreshold` AND `squeezePressure >= squeezeThreshold`, the cascade policy fires. `squeezePolicy` is a grid axis — training picks the best reaction per cell of the exit tensor.
+
+<CardGroup cols={2}>
+  <Card title="none" icon="arrow-right">
+    Normal entry. The cascade metrics are recorded in `volRegime` and `origin`, but no special action is taken. The position enters as if the cascade were not detected.
+  </Card>
+  <Card title="tighten" icon="compress">
+    Entry proceeds, but `trailingTake` is multiplied by `tightenFactor` (default `0.5`) — halved. The signal returns `action: "tighten"` and the `exit.trailingTake` is already tightened. Exit earlier, before the reversal arrives.
+  </Card>
+  <Card title="veto" icon="ban">
+    Skip the signal entirely. The position is never opened. A vetoed signal **never appears** in the output of `signals()`, `plan()`, or `backtest()`. Prod code never sees it — no `if (veto) continue` is needed.
+  </Card>
+  <Card title="invert" icon="arrows-rotate">
+    Enter **against** the post direction. A channel posted short → the cascade squeezes upward → `signals()` returns `action: "invert"`, `direction: "long"` (already flipped). The exit is resolved from the inverse cell of the tensor. `origin.invertedFrom` carries the original channel direction.
+  </Card>
+</CardGroup>
+
+There is also a fifth policy for research:
+
+**`ignore`** — the cascade is detected but deliberately not acted on. The position enters in the original direction, realizing the real (usually bad) PnL. Unlike `veto`, the signal does appear in output. This gives the counterfactual "what if we don't react to the cascade?" directly in the output, not only in offline analysis.
+
+---
+
+## Grid Axes
+
+The cascade detector is fully grid-searchable. Training tunes all of these per cell:
+
+| Axis | Default | What it controls |
+|---|---|---|
+| `volZThreshold` | `2.0` | Z-score threshold above which volume is "anomalous" |
+| `squeezeThreshold` | `0.6` | `squeezePressure` fraction that triggers the policy |
+| `squeezePolicy` | searched | Reaction: `none`, `tighten`, `veto`, `invert`, `ignore` |
+| `cascadeWindowMinutes` | falls back to `staleMinutes` | Window over which `squeezePressure` is measured |
+| `volBaselineWindow` | `20` | Number of candles before entry used as the volume baseline |
+
+Grid search values used during training:
+
+```ts
+volZThreshold:        [1.5, 2.5],
+squeezePolicy:        ["none", "tighten", "veto", "invert"],
+squeezeThreshold:     [0.55, 0.7],
+volBaselineWindow:    [20],
+cascadeWindowMinutes: [15, 30, 60],
+```
+
+---
+
+## Cascade Window Independence
+
+`cascadeWindowMinutes` is an independent axis, **not tied to `staleMinutes`** (the position lifetime). This distinction matters:
+
+- A squeeze is a **fast event** — it happens in minutes and produces a sharp reversal. Measuring squeeze pressure over a 24-hour holding horizon smears out the signal completely.
+- `staleMinutes` is the **maximum position lifetime** — the empirical impact horizon. It controls when the life-cap exit fires, not how wide the cascade detection window is.
+
+In an earlier version of the library, the cascade detection window was derived from `staleMinutes`, conflating two unrelated concerns. This caused cascade detection to degrade on slow-moving assets (large `staleMinutes`) where squeezes are still fast events. The two parameters are now independent — `cascadeWindowMinutes` falls back to `staleMinutes` only for backward compatibility when unset.
+
+```ts
+// correct: short detection window, long holding horizon
+{
+  cascadeWindowMinutes: 30,   // measure the squeeze over 30 minutes
+  staleMinutes: 720,          // hold the position for up to 12 hours
+}
+
+// wrong (old behavior): detection window = holding horizon
+// cascadeWindowMinutes: undefined → falls back to staleMinutes (720)
+```
+
+---
+
+## volumeFeatures Helper
+
+`volumeFeatures` computes both metrics in one call for the same entry candle. Use it when you need both `volZ` and `squeezePressure` for a position you are evaluating outside the main pipeline:
+
+```ts
+import { volumeFeatures } from "pump-anomaly";
+
+const features = volumeFeatures(
+  candles,           // ICandleData[], sorted by ts
+  entryIdx,          // index of the entry candle in the array
+  "long",            // direction
+  20,                // volBaselineWindow: candles before entry
+  30,                // cascadeWindowMinutes: horizon for squeezePressure
+);
+
+// features.volZ            — z-score of entry candle volume
+// features.squeezePressure — share of against-direction volume after entry
+```
+
+<Warning>
+  **Vetoed signals never appear in output.** When `squeezePolicy` is `"veto"` and both `volZ >= volZThreshold` and `squeezePressure >= squeezeThreshold`, the signal is filtered out internally by `signals()`, `plan()`, and `backtest()`. It does not appear as a record with a special flag — it is simply absent. Do not write `if (s.action === "veto") skip()` in prod code; that branch will never execute.
+
+  If you need to see vetoed signals for research (for example, to count how many entries were blocked), use `model.dump()` — the signal history includes records with `entered: false` and `reason: "cascade-veto"`.
+</Warning>

@@ -1,0 +1,106 @@
+---
+title: "Export Signal History for Post-Trade Analytics with dump()"
+sidebarTitle: "Signal History"
+description: "Use model.dump() to export the full signal history including non-entered signals, for external analytics, PnL attribution, and trade tracing."
+---
+
+After training, `model.dump()` gives you the complete signal history of the selected configuration — one flat record per candidate burst, including trades that did not enter, cascade vetoes, and inversions. This is the raw material for post-trade analytics: win-rate attribution, PnL distribution, regime analysis, and traceback to the exact source post that triggered a trade. The history is serialized inside `model.save()` and restored by `PumpMatrix.load()`, so it travels with the model.
+
+## dump() API
+
+```typescript
+model.dump();       // SignalRecord[] — array of plain objects (shallow copies)
+model.dump(true);   // JSON string
+model.historySize;  // number of records (0 if loaded without history)
+```
+
+`dump()` always returns a copy — mutating the returned array or its elements does not affect the model's internal state. `dump(true)` is a convenience for writing directly to disk or sending over HTTP. `historySize` lets you check whether history is present before calling `dump()`.
+
+## SignalRecord Fields
+
+Each record is a flat object with no nested sub-objects:
+
+```typescript
+interface SignalRecord {
+  id?: string;           // anchor parser-item id for traceback to the source post
+  ids?: string[];        // all parser-item ids folded into the burst (matrix may have several)
+  symbol: string;
+  direction: "long" | "short";
+  channel: string;
+  ts: number;            // signal time (burst ts), unix ms
+  entered: boolean;      // false for no-entry or cascade-veto
+  entryPrice: number;    // 0 if not entered
+  exitPrice: number;     // 0 if not entered
+  pnl: number;           // realized PnL, fraction (0.05 = +5%)
+  peak: number;          // peak PnL over the position's life (diagnostic)
+  reason: string;        // hard-stop | trailing-take | peak-staleness | life-cap | no-entry | cascade-veto
+  heldMinutes: number;
+  inverted: boolean;     // true if squeezePolicy="invert" fired and direction was flipped
+  volRegime: "calm" | "anomalous";
+  independentClusters: number;
+}
+```
+
+`pnl` is the honest realized fraction — consistent with `BacktestResult.pnl`. A hard-stop loss is `-(hardStop / 100)`, never softened to a prior peak.
+
+## Including Non-Entered Signals
+
+`dump()` includes every candidate burst evaluated by the selected training configuration, not only the ones that entered a position. Records with `entered: false` represent two distinct skip reasons:
+
+- **`reason: "no-entry"`** — candles existed but price never touched the entry zone during the full life-cap window.
+- **`reason: "cascade-veto"`** — the cascade detector fired `squeezePolicy = "veto"` and the signal was suppressed.
+
+Including these records means your analytics can count skips alongside realized trades — measuring how often the cascade filter fires, what fraction of signals fail to reach their entry zone, and whether skip rates vary by symbol or regime.
+
+## ID Threading for Traceback
+
+The `id` and `ids` fields thread the `ParserItem.id` through the full pipeline so a realized trade can be traced back to the exact source post.
+
+- A `ParserItem.id` can be a string or number. Numbers are normalized to strings before storage so the type is consistent in `dump()` records and `TradeSignal.origin`.
+- In matrix mode, several `ParserItem` entries from different channels can be folded into a single burst. `ids` contains all of their ids; `id` is the anchor (the earliest or primary item's id).
+- `id` survives `model.save()` / `PumpMatrix.load()` — it is serialized with the history and restored exactly.
+- When a `ParserItem` has no `id`, the field is simply absent from the record (`undefined`).
+
+## Persistence
+
+`dump()` data is embedded in the JSON produced by `model.save()`:
+
+```typescript
+const json = model.save();                         // includes full history
+fs.writeFileSync("model-weights.json", json);
+
+const restored = PumpMatrix.load(json);
+restored.historySize;                              // same count as original
+restored.dump();                                   // same records
+```
+
+If you load a model JSON that was produced without history (e.g. an older version or a deliberately stripped export), `historySize` returns `0` and `dump()` returns an empty array. No error is thrown.
+
+## Using dump() for Analytics
+
+Because `dump()` records are plain objects, they compose directly with standard array methods:
+
+```typescript
+const records = model.dump();
+
+// only look at trades that actually entered
+const entered = records.filter(r => r.entered);
+
+// basic win rate over entered trades
+const winRate = entered.filter(r => r.pnl > 0).length / entered.length;
+
+// average realized PnL
+const avgPnl = entered.reduce((s, r) => s + r.pnl, 0) / entered.length;
+
+// cascade veto rate across all signals
+const vetoRate = records.filter(r => r.reason === "cascade-veto").length / records.length;
+
+// regime breakdown
+const anomalous = records.filter(r => r.volRegime === "anomalous");
+```
+
+For richer percentile-based statistics, the model exposes `model.pnl` and `model.riskReward` computed over the same history — see the [Backtesting guide](/guides/backtesting) for their shape.
+
+<Note>
+  `dump()` is the training-time history of the **selected configuration** — the records come from replaying the chosen hyperparameters over the training data. `backtest()` is the same `replayExit` machinery applied to any `ParserItem[]` and candle source you pass at call time. Use `dump()` for understanding what training saw; use `backtest()` for evaluating new signals or time periods not in the training set.
+</Note>

@@ -1,0 +1,84 @@
+---
+title: "Pump Anomaly: Synchronized Crypto Pump Signal Detector"
+sidebarTitle: "Introduction"
+description: "Pump Anomaly is a TypeScript SDK for detecting multi-author synchronized pump signals in crypto, with path-aware exit replay and liquidation-cascade detection."
+---
+
+`pump-anomaly` is a TypeScript library for detecting **synchronized pump signals** in a stream of trading recommendations from Telegram channels and turning that detection into a ready-to-execute trade plan. It ingests a stream of `ParserItem[]` objects — one per channel post — runs a five-layer author-cluster pipeline to separate real coordinated capital inflow from single-actor channel manipulation, simulates your production exit on 1-minute OHLCV candles to produce honest training labels, and returns a flat `TradeSignal` array where direction, entry zone, and exit parameters are already resolved. Your application just executes — no conditional logic about veto, inversion, or mode is needed in prod code.
+
+---
+
+## The Three Problems It Solves
+
+Pump signals in Telegram exist in a noisy, adversarial environment. `pump-anomaly` is designed to address three distinct failure modes that simpler detectors miss.
+
+**1. Real capital vs. single-actor manipulation.** A single actor can operate dozens of anonymous Telegram channels and post the same ticker across all of them within seconds. Naive "multiple channels hit the same coin" detectors fire on every such broadcast. `pump-anomaly` builds an author-cluster graph using `jaccardScreen` → `lagXCorr` → `clusterAuthors` across the stationarity window, deduplicating co-owned channels into one cluster. A matrix signal only fires when **≥ 2 independent author clusters** converge on the same ticker — a statistical condition single-actor spam cannot satisfy.
+
+**2. Pump vs. stop hunt.** Many signals are deliberate traps: a channel pumps a coin, the crowd enters on leverage, and a coordinated liquidation cascade wipes those positions while the channel owner profits. A close-to-close label would miss this entirely — the candle closing above entry doesn't mean the position survived. `pump-anomaly` labels every training candidate through a **full path-aware replay** (`replayExit`) of your production exit (trailing take, hard stop, staleness exits) on 1m candles. A wick through the hard stop registers as a real loss, even if the close is positive. The liquidation-cascade detector (`squeezePressure`, `volZ`) identifies trap signals at inference time and routes them to one of four policies: `none`, `tighten`, `veto`, or `invert`.
+
+**3. Statistical certification of the edge.** A grid search over thousands of configurations always finds a "best" configuration, even on pure noise. `reliable` alone cannot catch this: it measures training-data quality, not whether the surviving config is a brute-force artifact. `pump-anomaly` applies five independent statistical barriers from the literature (Deflated Sharpe, PBO, SPA/Reality Check, minTRL, nested OOS) as an independent **certification judge** after model selection. `certified: false` means the model must not trade — an honest refusal rather than a silent overfit.
+
+---
+
+## How It Works
+
+At a high level, `pump-anomaly` separates training (slow, candle-bound, once) from inference (fast, stateless, milliseconds).
+
+<Steps>
+  <Step title="Feed ParserItem[] history">
+    Collect your historical Telegram signal stream as an array of `ParserItem` objects. Each item carries a `channel`, `symbol`, `direction`, `ts` timestamp, and an optional entry price zone. Extra fields (targets, stoploss, notes) are allowed and ignored.
+  </Step>
+  <Step title="Train the model with PumpMatrix.fit()">
+    Call `await PumpMatrix.fit(history, getCandles)`. The library labels every candidate burst by replaying your exit on 1m candles, then runs a time-series K-fold grid search over detector thresholds and exit parameters simultaneously. The winner is selected by the one-standard-error rule (most conservative configuration within 1 SE of the CV maximum) to guard against the winner's curse.
+  </Step>
+  <Step title="Check model.certification">
+    Inspect `model.certification.certified`. If `false`, read `model.certification.reasons` — the five-barrier certificate identified a brute-force artifact rather than a real edge. Do not trade a `certified: false` model. Retrain on more data or a different window.
+  </Step>
+  <Step title="Save and load without retraining">
+    Serialize with `model.save()` (returns a JSON string). In production, restore instantly with `PumpMatrix.load(json)` — no retraining, no candle requests. The serialized blob includes the exit tensor, policy, history, certification, and all metadata.
+  </Step>
+  <Step title="Execute live signals">
+    Call `model.signals(liveItems)` (fast, no candles) or `await model.plan(liveItems, getCandles)` (adds liquidation-cascade detection from pre-signal candles). Both return `TradeSignal[]` — every item is already executable. Direction is already inverted if the cascade policy called for inversion. Your application calls `openPosition(s.symbol, s.direction, { from: s.entryFromPrice, to: s.entryToPrice }, s.exit)` and nothing else.
+  </Step>
+</Steps>
+
+---
+
+## Key Concepts
+
+<CardGroup cols={2}>
+  <Card
+    title="How It Works (Deep Dive)"
+    icon="magnifying-glass"
+    href="/concepts/how-it-works"
+  >
+    The five detector layers, stationarity window, burst enumeration, and how the matrix and single modes differ in their entry conditions.
+  </Card>
+  <Card
+    title="Detector Layers"
+    icon="layer-group"
+    href="/concepts/detector-layers"
+  >
+    selfTuneLag → jaccardScreen → lagXCorr → clusterAuthors → earlyWarning: what each layer does and why the ordering matters for author deduplication.
+  </Card>
+  <Card
+    title="Exit Tensor"
+    icon="table-cells"
+    href="/concepts/exit-tensor"
+  >
+    The five-dimensional exit tensor `[mode][channel][symbol][direction][volRegime]` and its hierarchical fallback chain: cell → symbol-dir → mode → global.
+  </Card>
+  <Card
+    title="Liquidation-Cascade Detection"
+    icon="triangle-exclamation"
+    href="/concepts/liquidation-cascade"
+  >
+    How `volZ` and `squeezePressure` detect stop hunts and long/short cascades, and the four `squeezePolicy` reactions: none, tighten, veto, invert.
+  </Card>
+</CardGroup>
+
+---
+
+## License
+
+`pump-anomaly` is released under the **MIT License**. See the [LICENSE](https://github.com/tripolskypetr/pump-anomaly/blob/master/LICENSE) file in the repository for the full text.

@@ -1,0 +1,108 @@
+---
+title: "ParserItem: Telegram Channel Signal Input Contract"
+sidebarTitle: "ParserItem"
+description: "Reference for the ParserItem interface — the input type representing a single Telegram channel trading recommendation fed to PumpMatrix."
+---
+
+`ParserItem` is the primary input to all `PumpMatrix` methods. It represents one trading recommendation from a Telegram channel — a single row in the stream of channel signals that the library processes, deduplicates, and converts into executable trade plans.
+
+## Interface
+
+```typescript
+interface ParserItem {
+  channel: string;
+  symbol: string;
+  direction: "long" | "short";
+  ts: number;               // unix time of publication, ms
+  entryFromPrice?: number;  // lower bound of entry zone
+  entryToPrice?: number;    // upper bound of entry zone
+  id?: string | number;     // optional source id for traceback
+  [extra: string]: unknown; // targets/stoploss/... allowed and ignored
+}
+```
+
+## Field Reference
+
+<ResponseField name="channel" type="string" required>
+  The channel handle or identifier the signal originated from (e.g. `"@crypto_signals"`). This is the key into the exit tensor — exit parameters are trained separately per channel. It is also used for author-cluster deduplication: channels belonging to the same operator are merged into one author cluster so that a single actor firing multiple anonymous channels cannot manufacture a false multi-author burst.
+</ResponseField>
+
+<ResponseField name="symbol" type="string" required>
+  The trading pair the recommendation refers to, e.g. `"SOLUSDT"` or `"BTCUSDT"`. Must match exactly what your `getCandles` implementation accepts, because this value is passed verbatim to `getCandles` during training and live operation.
+</ResponseField>
+
+<ResponseField name="direction" type='"long" | "short"' required>
+  The trade direction as published in the channel. `"long"` = bullish recommendation; `"short"` = bearish. The library may invert this direction at runtime (see `action: "invert"`) when a liquidation-cascade signal is detected, but the raw channel direction is preserved in `origin.invertedFrom` for audit.
+</ResponseField>
+
+<ResponseField name="ts" type="number" required>
+  Unix timestamp of publication in **milliseconds**. This is the temporal anchor used for burst detection, candle alignment, and entry-zone logic. Non-finite values (`NaN`, `Infinity`) cause the item to be silently skipped during input validation.
+</ResponseField>
+
+<ResponseField name="entryFromPrice" type="number" optional>
+  Lower bound of the entry zone in absolute price. When present, the replay simulation enters only once a candle's price range touches this zone. If absent, entry is taken at the open of the first fully-formed candle after the signal (`entryStartTs`), which avoids look-ahead on the still-forming signal candle.
+</ResponseField>
+
+<ResponseField name="entryToPrice" type="number" optional>
+  Upper bound of the entry zone in absolute price. Used together with `entryFromPrice` to define the entry band. The replay entry price is clamped to the actual candle `[low, high]` range — a conservative mid-zone estimate of the realistic fill price.
+</ResponseField>
+
+<ResponseField name="id" type="string | number" optional>
+  An opaque identifier for the source post. Numeric values are normalized to string internally. The `id` is threaded through the entire pipeline without modification — it surfaces in `SignalRecord.id` (from `dump()`), `TradeSignal.origin.id`, and `BacktestSignal.origin.id`, enabling a realized trade or backtest result to be traced back to the exact Telegram post that originated it.
+</ResponseField>
+
+## Extra Fields
+
+The index signature `[extra: string]: unknown` means any additional fields are accepted and silently ignored. This makes `ParserItem` directly compatible with richer parser-item schemas that carry targets, stoploss levels, confidence scores, or other annotation fields. None of those fields affect the library's behavior.
+
+```typescript
+// All of these are valid and harmless:
+const item: ParserItem = {
+  channel: "@crypto_signals",
+  symbol: "SOLUSDT",
+  direction: "long",
+  ts: Date.now(),
+  stoploss: 145.00,
+  targets: [155, 160, 170],
+  confidence: 0.87,
+  raw: { postId: 99, text: "SOL long now" },
+};
+```
+
+## Input Validation
+
+The library validates and filters items at the point of ingestion. An item is silently skipped if any of the following are true:
+
+- `channel` is missing or not a string
+- `symbol` is missing or not a string
+- `direction` is not `"long"` or `"short"`
+- `ts` is missing, not a number, or not finite (`NaN`, `Infinity`, `-Infinity`)
+
+No exception is thrown — invalid items are dropped without crashing the call. This makes the library robust to sparse or partially-parsed channel feeds.
+
+## ID Threading
+
+The `id` field follows a signal from ingestion to every output surface:
+
+- **`dump()`** — `SignalRecord.id` holds the anchor item's id; `SignalRecord.ids` holds all item ids that contributed to a matrix burst.
+- **`plan()` / `signals()` / `backtest()`** — `TradeSignal.origin.id` and `TradeSignal.origin.ids` carry the same values into live and backtest outputs.
+- **`explain()`** — `PumpVerdict.id` and `PumpVerdict.ids` on each verdict.
+
+Numeric ids are normalized to string at ingestion time (`42` → `"42"`). In matrix mode, a burst may collapse several parser-items from different channels into a single signal; all of their ids are collected in `ids` (plural) while `id` points to the anchor item (last in the window).
+
+## Example
+
+```typescript
+const item: ParserItem = {
+  channel: "@crypto_signals",
+  symbol: "SOLUSDT",
+  direction: "long",
+  ts: Date.now(),
+  entryFromPrice: 148.50,
+  entryToPrice: 151.20,
+  id: 12345,
+  // extra fields are fine:
+  stoploss: 145.00,
+  targets: [155, 160, 170],
+};
+```

@@ -1,0 +1,576 @@
+---
+title: "PumpMatrix Class: Train, Load, and Execute Signals"
+sidebarTitle: "PumpMatrix"
+description: "Complete API reference for the PumpMatrix class — fit(), load(), save(), signals(), plan(), backtest(), planFor(), planForAt(), explain(), dump(), and all model properties."
+---
+
+`PumpMatrix` is the main facade of the `pump-anomaly` library. It wraps the full training pipeline, the exit tensor, the liquidation-cascade detector, and the serialized allow-list policy into a single stable class. After training once with `PumpMatrix.fit()`, you call `model.save()` to persist the weights, then `PumpMatrix.load()` in production to restore the model without retraining. Execution methods — `signals()`, `plan()`, `backtest()`, `planFor()`, and `planForAt()` — return only actionable `TradeSignal` objects; veto decisions are filtered out internally before the result is returned.
+
+```typescript
+import { PumpMatrix } from "pump-anomaly";
+import * as fs from "fs";
+
+// 1) Train once on channel-signal history
+const model = await PumpMatrix.fit(history, getCandles);
+fs.writeFileSync("model.json", model.save());
+
+// 2) In production — restore, no retraining
+const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
+
+// signals() returns ONLY executable signals — veto is already filtered out
+for (const s of model.signals(liveItems)) {
+  openPosition(s.symbol, s.direction, { from: s.entryFromPrice, to: s.entryToPrice }, s.exit);
+}
+```
+
+---
+
+## Static Methods
+
+### PumpMatrix.fit()
+
+Trains a new model from scratch on a history of channel signals. This is the slow path: it fetches 1m candles for every candidate burst, replays your production exit plan (trailing take / hard stop / staleness) over those candles to assign labels, then runs a grid search with time-series K-fold cross-validation. The winner is chosen by the one-standard-error rule (Breiman) rather than argmax, to avoid overfitting to grid noise.
+
+```typescript
+static async fit(
+  history: ParserItem[],
+  getCandles: GetCandles,
+  opts?: TrainOptions,
+): Promise<PumpMatrix>
+```
+
+<ParamField path="history" type="ParserItem[]" required>
+  Array of channel-signal objects. Each item must have `channel`, `symbol`, `direction`, and `ts` (Unix ms). Optional `entryFromPrice` / `entryToPrice` define the entry zone; an optional `id` threads through to `dump()` and live-signal `origin` for post-level tracebacks.
+</ParamField>
+
+<ParamField path="getCandles" type="GetCandles" required>
+  Async candle source with signature `(symbol, interval, limit?, sDate?, eDate?) => Promise<ICandleData[]>`. Training labels are built on 1m candles. The same function is reused by `plan()` at runtime for live cascade detection.
+</ParamField>
+
+<ParamField path="opts" type="TrainOptions">
+  Optional training configuration. Key fields:
+
+  - `grid?: Partial<TrainGrid>` — override any grid axis (e.g. narrow `hardStop` or `staleMinutes`).
+  - `folds?: number` — time-series K-fold count (default `4`).
+  - `shrinkageK?: number` — shrinkage strength for the objective `mean · N/(N+k)` (default `5`).
+  - `mode?: "auto" | "matrix" | "single"` — entry-selection mode. `auto` (default) picks `matrix` when the author correlation is viable, otherwise falls back to `single`.
+  - `policy?: SignalPolicy` — allow-list baked into the model at training time (serialized into model JSON). Execution can only narrow this, never widen it.
+  - `reliability?: Partial<ReliabilityConfig>` — override confidence thresholds.
+  - `viability?: Partial<ViabilityConfig>` — override matrix-viability thresholds for auto mode.
+  - `selection?: Partial<SelectionConfig>` — SE-corridor multiplier and nested-CV outer folds.
+  - `onProgress?: ProgressFn` — progress callback. Defaults to a stdout bar; pass `silentProgress` to suppress.
+  - `metaLedger?: MetaLedgerState` — meta-overfitting guard: if provided, the DSR certificate uses `Σ configs` across all past fit attempts instead of just this grid's size.
+</ParamField>
+
+**Returns** `Promise<PumpMatrix>` — a fully trained, ready-to-use model instance.
+
+---
+
+### PumpMatrix.load()
+
+Restores a previously trained model from serialized JSON. Does not retrain or touch candles. Use this in production after `model.save()` wrote the weights to disk.
+
+```typescript
+static load(json: string | TrainedParams): PumpMatrix
+```
+
+<ParamField path="json" type="string | TrainedParams" required>
+  Either the JSON string produced by `model.save()`, or a pre-parsed `TrainedParams` object (e.g. imported from a `.json` file with `with { type: "json" }`). The method handles backward-compatibility defaults for `policy`, `riskReward`, and `pnl` fields that were absent in earlier serialized models.
+</ParamField>
+
+**Returns** `PumpMatrix` — a fully functional model instance without retraining.
+
+```typescript
+// From a JSON file on disk
+const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
+
+// From a pre-imported JSON asset (e.g. bundler / Deno)
+import weights from "./assets/model-weights.json" with { type: "json" };
+const model = PumpMatrix.load(weights);
+```
+
+<Note>
+  Only params `version: 3` is supported. Models serialized by older versions of the library (v1 or v2) are incompatible due to structural changes in the exit tensor — retrain to upgrade.
+</Note>
+
+---
+
+## Execution Methods
+
+Three methods cover the three candle-access patterns. Choose based on whether you are running live, have preloaded candles, or are replaying closed history.
+
+| Method | Candles used | Returns | Use |
+|---|---|---|---|
+| `signals(items, policy?)` | None | `TradeSignal[]` | Fast path — cascade not evaluated; every outcome is `enter` |
+| `plan(items, source, policy?)` | Strictly **before** the signal | `TradeSignal[]` or `Promise<TradeSignal[]>` | Live decision — no look-ahead |
+| `backtest(items, source, policy?)` | **After** the signal | `BacktestSignal[]` or `Promise<BacktestSignal[]>` | Replay over closed history with realized PnL |
+
+---
+
+### signals()
+
+The main production call when you do not have candles available. Returns only executable signals — veto (liquidation cascade) is already filtered out. Because no candles are provided, the cascade detector is not evaluated, so every returned signal has `action: "enter"`.
+
+```typescript
+signals(items: ParserItem[], policy?: Partial<SignalPolicy>): TradeSignal[]
+```
+
+<ParamField path="items" type="ParserItem[]" required>
+  Live channel signals to evaluate.
+</ParamField>
+
+<ParamField path="policy" type="Partial<SignalPolicy>">
+  Optional runtime policy that can only **narrow** the trained allow-list — never widen it. For example `{ allow: ["enter"] }` suppresses inversion signals for this call only.
+</ParamField>
+
+**Returns** `TradeSignal[]` — flat array of executable signals. Empty if all signals were vetoed or filtered by policy.
+
+---
+
+### plan()
+
+Live decision — fetches candles strictly **before** the signal to evaluate volume regime and squeeze pressure (`squeezePressureBefore`). Never looks at candles from the future. Accepts either an async `getCandles` function (returns a `Promise`) or a pre-loaded `{ symbol: candles }` map (returns synchronously).
+
+```typescript
+plan(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>
+plan(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[]
+```
+
+<ParamField path="items" type="ParserItem[]" required>
+  Live channel signals to evaluate.
+</ParamField>
+
+<ParamField path="source" type="GetCandles | Record<string, ICandleData[]>" required>
+  Candle source. Pass a `getCandles` function for the async path (same function used in `fit`), or a pre-loaded `{ SOLUSDT: candles, ... }` map for the synchronous path. A broken symbol (data gap or adapter error) degrades gracefully to a no-candle signal rather than crashing the whole call.
+</ParamField>
+
+<ParamField path="policy" type="Partial<SignalPolicy>">
+  Optional runtime policy narrowing.
+</ParamField>
+
+**Returns** `Promise<TradeSignal[]>` (async) or `TradeSignal[]` (sync map).
+
+```typescript
+// Async — same getCandles used for fit
+const trades = await model.plan(liveItems, getCandles);
+
+// Sync — pre-loaded candle dictionary
+const trades = model.plan(liveItems, { SOLUSDT: preloadedCandles });
+```
+
+---
+
+### backtest()
+
+Replays each signal forward over closed historical candles and returns the realized PnL alongside the signal. Cascade pressure is evaluated from candles **after** the entry (`squeezePressure` rather than `squeezePressureBefore`), which is permissible because the history is already closed. Returns `BacktestSignal` — a `TradeSignal` extended with a `result` field containing `pnl`, `reason`, `heldMinutes`, etc.
+
+```typescript
+backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<BacktestSignal[]>
+backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): BacktestSignal[]
+```
+
+<ParamField path="items" type="ParserItem[]" required>
+  Historical channel signals to replay.
+</ParamField>
+
+<ParamField path="source" type="GetCandles | Record<string, ICandleData[]>" required>
+  Candle source providing candles **after** the signal (forward over the impact horizon). Same dual-overload pattern as `plan()`.
+</ParamField>
+
+<ParamField path="policy" type="Partial<SignalPolicy>">
+  Optional runtime policy narrowing.
+</ParamField>
+
+**Returns** `Promise<BacktestSignal[]>` (async) or `BacktestSignal[]` (sync map).
+
+```typescript
+const results = await model.backtest(historicalItems, getCandles);
+for (const s of results) {
+  console.log(s.symbol, s.direction, s.result.pnl, s.result.reason);
+}
+```
+
+---
+
+### planFor()
+
+Single-position live helper. Builds one `TradeSignal` for a known `(symbol, direction, channel)` from a pre-loaded candle slice. Cascade is evaluated from candles before the last candle's timestamp (live, no look-ahead). Returns `null` on veto or policy rejection.
+
+```typescript
+planFor(
+  symbol: string,
+  direction: Direction,
+  channel: string | null,
+  candles: ICandleData[],
+  policy?: Partial<SignalPolicy>,
+): TradeSignal | null
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="direction" type='"long" | "short"' required>
+  Channel-posted direction (before any inversion).
+</ParamField>
+
+<ParamField path="channel" type="string | null" required>
+  Channel name, or `null` for matrix-mode signals.
+</ParamField>
+
+<ParamField path="candles" type="ICandleData[]" required>
+  Pre-loaded 1m candles ending at the signal timestamp. The entry timestamp is taken from the last candle.
+</ParamField>
+
+<ParamField path="policy" type="Partial<SignalPolicy>">
+  Optional runtime policy narrowing.
+</ParamField>
+
+**Returns** `TradeSignal | null` — ready signal, or `null` if vetoed or outside policy.
+
+---
+
+### planForAt()
+
+Single-position backtest helper. Like `planFor()` but for a specific `entryTs` in the past, replaying the exit plan forward over the provided candles. Returns a `BacktestSignal` with the fully realized `result`.
+
+```typescript
+planForAt(
+  symbol: string,
+  direction: Direction,
+  channel: string | null,
+  candles: ICandleData[],
+  entryTs: number,
+  policy?: Partial<SignalPolicy>,
+): BacktestSignal | null
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair.
+</ParamField>
+
+<ParamField path="direction" type='"long" | "short"' required>
+  Channel-posted direction.
+</ParamField>
+
+<ParamField path="channel" type="string | null" required>
+  Channel name, or `null` for matrix mode.
+</ParamField>
+
+<ParamField path="candles" type="ICandleData[]" required>
+  1m candles covering the forward window from `entryTs`. Entry zone defaults to `open` of the first candle (no `entryFromPrice` / `entryToPrice` override).
+</ParamField>
+
+<ParamField path="entryTs" type="number" required>
+  Signal timestamp in Unix milliseconds.
+</ParamField>
+
+<ParamField path="policy" type="Partial<SignalPolicy>">
+  Optional runtime policy narrowing.
+</ParamField>
+
+**Returns** `BacktestSignal | null` — signal with replayed `result`, or `null` on veto/policy rejection.
+
+---
+
+### explain()
+
+Returns the full internal prediction report for debugging: all verdicts (including skipped), the author cluster map, the detected lag τ, the burst window, the used mode, and the viability assessment. Useful for understanding why a particular burst was or was not turned into a signal.
+
+```typescript
+explain(items: ParserItem[]): PredictionResult
+```
+
+<ParamField path="items" type="ParserItem[]" required>
+  Items to evaluate.
+</ParamField>
+
+**Returns** `PredictionResult` with:
+- `signals` — only `action: "open"` verdicts, sorted by confidence descending
+- `verdicts` — all verdicts including `action: "skip"`
+- `authors` — `Map<channel, clusterId>` showing which channels belong to the same author cluster
+- `authorCount` — number of independent authors detected
+- `tauMs` — self-estimated characteristic lag between sibling channels
+- `windowMs` — effective burst synchrony window
+- `usedMode` — `"matrix"` or `"single"` as actually executed
+- `viability` — why auto mode chose matrix or single (with `reason` string)
+
+---
+
+## Serialization
+
+### save()
+
+Serializes the full model to a JSON string. The output includes the trained detector config, exit tensor, policy, risk-reward statistics, PnL statistics, signal history, and all metadata. Pass this string to `PumpMatrix.load()` to restore without retraining.
+
+```typescript
+save(): string
+```
+
+**Returns** `string` — JSON representation of `TrainedParams` (version 3).
+
+---
+
+### dump()
+
+Exports the training-time signal history of the selected configuration as a flat array of `SignalRecord` objects, or as a JSON string. Includes signals that did **not** enter (`entered: false`) — non-entries from no-entry or cascade-veto — so external analytics can count skips alongside realized trades.
+
+```typescript
+dump(asString: true): string
+dump(asString?: false): SignalRecord[]
+```
+
+<ParamField path="asString" type="boolean">
+  If `true`, returns a JSON string. If `false` or omitted, returns a `SignalRecord[]` array. Defaults to `false`.
+</ParamField>
+
+**Returns** `SignalRecord[] | string`.
+
+```typescript
+// Array for in-process analytics
+const records = model.dump();
+
+// JSON string for writing to disk
+fs.writeFileSync("signals.json", model.dump(true));
+```
+
+Each `SignalRecord` contains: `id?`, `ids?`, `symbol`, `direction`, `channel`, `ts`, `entered`, `entryPrice`, `exitPrice`, `pnl`, `peak`, `reason`, `heldMinutes`, `inverted`, `volRegime`, `independentClusters`.
+
+---
+
+### historySize
+
+```typescript
+get historySize(): number
+```
+
+Number of records in the signal history. Returns `0` if the model was loaded from JSON that did not include history (e.g. stripped for deployment size).
+
+---
+
+## Model Properties
+
+These read-only getters expose training diagnostics, configuration, and statistics baked into the model.
+
+### reliable
+
+```typescript
+get reliable(): boolean
+```
+
+`true` if training had sufficient data for the model to be trustworthy. Computed as `confidence >= 0.6 AND totalN >= 40`. On a small sample this is `false` — the model still produces signals but warns you honestly. Grows to `true` as data accumulates.
+
+---
+
+### confidence
+
+```typescript
+get confidence(): number
+```
+
+Composite trust score in `[0, 1]`, computed as `support × stability × significance`. Each axis grows independently as data grows — support from sample size, stability from cross-fold consistency, significance from a t-test against zero. No code changes needed as data accumulates.
+
+---
+
+### certification
+
+```typescript
+get certification(): Certification
+```
+
+Five-barrier statistical certificate proving the trained edge is real and not a brute-force artifact of the grid search:
+
+```typescript
+interface Certification {
+  certified: boolean;      // false → model should NOT trade
+  dsr: number;             // Deflated Sharpe Ratio (threshold ≥ 0.95)
+  pbo: number;             // Probability of Backtest Overfitting (threshold ≤ 0.10)
+  spaPValue: number;       // SPA / Reality Check p-value (threshold ≤ 0.05)
+  minTRL: number;          // minimum track-record length for significance
+  actualN: number;         // actual number of trades
+  nestedScore: number | null; // unbiased nested-CV out-of-sample score (must be > 0)
+  reasons: string[];       // WHY it is not certified (empty when certified: true)
+}
+```
+
+`certified: false` is the honest refusal — training ran and argmax found a "best" config, but the certificate says the winner is a noise artifact. The e2e test `fit-noise-rejection` verifies that a full `fit` on a pure random walk always produces `certified: false`.
+
+---
+
+### effectiveTrials
+
+```typescript
+get effectiveTrials(): number
+```
+
+Total trial count with family-wise correction for a chain of `fit` calls (meta-overfitting guard). If `metaLedger` was passed to `fit`, this equals `Σ configs` across all past fit attempts — the honest denominator for DSR. Without `metaLedger`, equals `innerTrials` (single fit, naïve N).
+
+---
+
+### innerTrials
+
+```typescript
+get innerTrials(): number
+```
+
+Number of configurations in the grid of the current `fit` call. Used as the baseline for the DSR N-trials penalty in a single-fit scenario.
+
+---
+
+### fitAttempts
+
+```typescript
+get fitAttempts(): number
+```
+
+How many times `fit` has been run in the tracked chain (from `metaLedger`). Useful for auditing the meta-trial count in a self-learning loop.
+
+---
+
+### labeling
+
+```typescript
+get labeling(): {
+  candidates: number;
+  outcomes: Partial<Record<"ok" | "adapter-error" | "no-candles" | "no-entry", number>>;
+  errors: Record<string, number>;
+}
+```
+
+Diagnostics from the labeling phase. When `totalSamples` is zero, `outcomes` reveals why:
+
+- `ok` — labeled and entered
+- `adapter-error` — `getCandles` threw (look-ahead guard, data gap, unknown symbol)
+- `no-candles` — `getCandles` returned empty (symbol or range gave nothing)
+- `no-entry` — candles exist but no exit set entered the zone
+
+`errors` maps each unique `getCandles` exception message to its occurrence count (e.g. `{ "ccxt: symbol not found": 32 }`), so adapter errors are never silent.
+
+---
+
+### impactHorizonMinutes
+
+```typescript
+get impactHorizonMinutes(): number
+```
+
+Empirical post-impact horizon in minutes (global level of the exit tensor). This is the `staleMinutes` value selected by the grid for the global fallback — the maximum time a position is held before life-cap exit.
+
+---
+
+### mode
+
+```typescript
+get mode(): "matrix" | "single"
+```
+
+The mode the model was trained in. `"matrix"` requires ≥ 2 independent author clusters converging on the same ticker. `"single"` treats every post as an entry; exit quality decides the outcome.
+
+---
+
+### modeReason
+
+```typescript
+get modeReason(): string
+```
+
+Human-readable explanation of why this mode was chosen. Examples:
+- `"auto → single: one channel — correlation impossible"`
+- `"auto → matrix: 3 strong edges, overlap 5, clusters >1: 2"`
+- `"matrix задан явно (opts.mode)"`
+
+---
+
+### minClusters
+
+```typescript
+get minClusters(): number
+```
+
+Minimum number of independent author clusters that must converge on a ticker for a matrix burst to count as a signal. Default `2`. Not applied in single mode.
+
+---
+
+### minSharedEvents
+
+```typescript
+get minSharedEvents(): number
+```
+
+Minimum shared events between channels for the author matrix to be considered viable (not a noise coincidence). From `config.viability`. Default `3`.
+
+---
+
+### lookbackMinutes
+
+```typescript
+get lookbackMinutes(): number
+```
+
+How many minutes of 1m candle history before the signal `plan()` needs per signal: `max(volBaselineWindow, cascadeWindowMinutes) + 5`. In production, keep at least this many minutes of candle history available for every fresh signal.
+
+---
+
+### exit
+
+```typescript
+get exit(): ExitTensor
+```
+
+The full trained exit tensor, structured as `[mode][channel][symbol][direction][volRegime]` with hierarchical fallback through `symbol-dir → mode → global`. Exposed for auditing which cell resolved a given signal's exit via `origin.exitSource`.
+
+---
+
+### policy
+
+```typescript
+get policy(): SignalPolicy
+```
+
+A read-only copy of the allow-list baked into the model at training time. Runtime calls can only narrow this — they cannot re-add actions that training forbade.
+
+---
+
+### riskReward
+
+```typescript
+get riskReward(): {
+  global: RiskRewardStats;
+  bySymbol: Record<string, RiskRewardStats>;
+}
+```
+
+Risk-reward statistics from backtest, where RR per trade = `pnl / hardStop` (units of risk captured). Per-symbol statistics are used by the runtime `minRiskReward` filter; global is for reporting.
+
+```typescript
+interface RiskRewardStats {
+  mean: number;   // mean RR across all trades
+  p95:  number;   // 95th-percentile RR
+  p99:  number;   // 99th-percentile RR
+  n:    number;   // number of trades in the sample
+}
+```
+
+---
+
+### pnl
+
+```typescript
+get pnl(): {
+  global: PnlStats;
+  bySymbol: Record<string, PnlStats>;
+}
+```
+
+Outlier-robust PnL statistics. The median and percentiles prevent a single bad or outsized trade from distorting the system's edge.
+
+```typescript
+interface PnlStats {
+  mean:   number;  // mean PnL (sensitive to outliers — for comparison)
+  median: number;  // robust center, immune to outliers
+  p5:     number;  // lower tail — how bad the worst 5% are
+  p95:    number;  // upper tail
+  p99:    number;  // extreme upper tail
+  n:      number;  // number of trades
+}
+```

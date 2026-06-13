@@ -1,47 +1,302 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Pump Anomaly in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install pump-anomaly, define your getCandles adapter, train a model on historical Telegram signals, and execute your first live trade plan."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you from a fresh install to a live-ready trade plan in a single file. You will install the package, define the `getCandles` adapter that connects the library to your exchange data source, train a model on historical `ParserItem[]` signals, verify the statistical certificate, persist the model to disk, and call `plan()` to get executable `TradeSignal[]` objects. The whole flow — including serialization — takes under 100 lines of TypeScript.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+---
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
+  <Step title="Install the package">
+    Add `pump-anomaly` to your project with your preferred package manager.
+
+    <CodeGroup>
+      ```bash npm
+      npm install pump-anomaly
+      ```
+
+      ```bash yarn
+      yarn add pump-anomaly
+      ```
+
+      ```bash pnpm
+      pnpm add pump-anomaly
+      ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Understand the ParserItem data shape">
+    Every signal in your Telegram history must conform to the `ParserItem` interface. Only `channel`, `symbol`, `direction`, and `ts` are required by the detector — all other fields are passed through untouched.
+
+    ```typescript
+    import type { ParserItem } from "pump-anomaly";
+
+    // The interface from types.ts — all fields the library reads:
+    interface ParserItem {
+      channel: string;           // Telegram channel identifier (required)
+      symbol: string;            // e.g. "SOLUSDT"
+      direction: "long" | "short";
+      ts: number;                // unix time of publication, milliseconds
+      entryFromPrice?: number;   // lower bound of entry zone (optional)
+      entryToPrice?: number;     // upper bound of entry zone (optional)
+      id?: string | number;      // optional source post id — threaded to dump() and origin
+      [extra: string]: unknown;  // targets/stoploss/etc. are allowed and ignored
+    }
+
+    // Minimal valid example:
+    const item: ParserItem = {
+      channel: "alpha_calls",
+      symbol: "SOLUSDT",
+      direction: "long",
+      ts: 1_700_000_000_000,
+    };
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Implement the getCandles adapter">
+    `pump-anomaly` needs an async function that fetches 1-minute OHLCV candles from your exchange. The signature is fixed — implement it once and reuse it for training, live, and backtest.
+
+    ```typescript
+    import type { GetCandles, ICandleData } from "pump-anomaly";
+
+    // The full type from candle.ts:
+    // type CandleInterval = "1m"|"3m"|"5m"|"15m"|"30m"|"1h"|"2h"|"4h"|"6h"|"8h"|"1d";
+    //
+    // type GetCandles = (
+    //   symbol: string,
+    //   interval: CandleInterval,
+    //   limit?: number,
+    //   sDate?: number,   // inclusive, unix ms
+    //   eDate?: number,   // exclusive, unix ms
+    // ) => Promise<ICandleData[]>;
+
+    // Minimal ccxt / Binance example:
+    import ccxt from "ccxt";
+
+    const exchange = new ccxt.binance({
+      enableRateLimit: true,
+      options: { defaultType: "spot" },
+    });
+    await exchange.loadMarkets();
+
+    const getCandles: GetCandles = async (symbol, interval, limit, sDate, eDate) => {
+      const rows = await exchange.fetchOHLCV(
+        symbol,
+        interval,
+        sDate,           // since (ms) — undefined is fine for ccxt
+        limit,
+      );
+      return rows.map(([timestamp, open, high, low, close, volume]) => ({
+        timestamp,   // unix ms, candle OPEN time
+        open,
+        high,
+        low,
+        close,
+        volume,
+      })) as ICandleData[];
+    };
+    ```
+
+    <Note>
+      The library internally chunks large candle requests with `fetchCandlesChunked` — your adapter does not need to paginate. If your adapter throws (e.g. unknown symbol, rate-limit), that candidate is skipped and training continues rather than crashing.
+    </Note>
+  </Step>
+
+  <Step title="Train the model with PumpMatrix.fit()">
+    Pass your full `ParserItem[]` history and the `getCandles` adapter. Training replays each candidate burst on 1m candles, runs a K-fold grid search, and selects the most conservative configuration within one standard error of the CV maximum.
+
+    ```typescript
+    import { PumpMatrix, silentProgress } from "pump-anomaly";
+    import type { ParserItem } from "pump-anomaly";
+    import * as fs from "fs";
+
+    // Load your historical channel signals (e.g. from a JSON file):
+    const history: ParserItem[] = JSON.parse(
+      fs.readFileSync("assets/parser-items.json", "utf8")
+    );
+
+    // Train — this is the slow step (IO-bound candle labeling):
+    const model = await PumpMatrix.fit(history, getCandles, {
+      // Silence the stdout progress bar in scripts; omit for the default bar:
+      onProgress: silentProgress,
+    });
+
+    console.log("Mode:", model.mode);          // "matrix" | "single"
+    console.log("Reliable:", model.reliable);  // did training have enough data?
+    console.log("Confidence:", model.confidence); // 0..1
+    ```
+
+    A stdout progress bar renders by default across three phases — `label` (candle replay, slow), `score` (grid evaluation from cache), and `nested` (one tick per outer nested-CV fold):
+
+    ```
+    [██████████████░░░░░░░░░░░░░░░░] 47% (42/90) label TRXUSDT
+    [██████████████████████████████] 100% (27/27) score 5|0.4|0.6|all
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Check model.certification.certified">
+    Before saving or trading, verify that the five statistical barriers all passed. A grid search always finds a "best" configuration — even on pure noise. The certificate is the independent judge that confirms the edge is real.
+
+    ```typescript
+    const cert = model.certification;
+
+    if (!cert.certified) {
+      console.warn("Model NOT certified — do not trade.");
+      console.warn("Reasons:", cert.reasons);
+      // cert.reasons might contain entries like:
+      //   "DSR 0.82 < threshold 0.95"
+      //   "PBO 0.23 > threshold 0.10"
+      //   "SPA p=0.12 > threshold 0.05"
+      //   "actualN 28 < minTRL 35"
+      //   "nestedScore -0.003 ≤ 0"
+      process.exit(1);
+    }
+
+    console.log("Certified ✓");
+    console.log("  DSR:", cert.dsr);           // Deflated Sharpe Ratio (≥ 0.95)
+    console.log("  PBO:", cert.pbo);           // Probability of Backtest Overfitting (≤ 0.10)
+    console.log("  SPA p-value:", cert.spaPValue); // ≤ 0.05
+    console.log("  N:", cert.actualN, "≥ minTRL:", cert.minTRL);
+    console.log("  Nested OOS score:", cert.nestedScore); // > 0
+    ```
+
+    <Warning>
+      A `certified: false` model still has an `argmax` winner from the grid. That winner is a brute-force artifact, not a real edge. The `reliable` flag alone cannot detect this — only the certificate can. Do not trade until `certified: true`.
+    </Warning>
+  </Step>
+
+  <Step title="Save the model and reload it in production">
+    Serialize the trained model to a JSON string with `model.save()`. In production, restore it instantly with `PumpMatrix.load()` — no retraining, no candle requests.
+
+    ```typescript
+    // Save (after training):
+    const json = model.save(); // JSON string — includes exit tensor, policy, history, cert
+    fs.writeFileSync("assets/model-weights.json", json, "utf8");
+    console.log("Saved", json.length, "bytes");
+
+    // Load in production (fast, no getCandles needed):
+    const saved = fs.readFileSync("assets/model-weights.json", "utf8");
+    const prodModel = PumpMatrix.load(saved);
+
+    // Alternatively, load from an already-parsed object:
+    const weights = JSON.parse(saved);
+    const prodModel2 = PumpMatrix.load(weights);
+
+    console.log("Loaded model, mode:", prodModel.mode);
+    console.log("Impact horizon:", prodModel.impactHorizonMinutes, "min");
+    console.log("Lookback needed for plan():", prodModel.lookbackMinutes, "min");
     ```
   </Step>
+
+  <Step title="Execute live signals with model.plan()">
+    In production, call `model.plan(liveItems, getCandles)` to get cascade-aware executable signals. Each `TradeSignal` has direction already resolved (inversion applied if needed), an entry zone, and a flat exit plan ready to pass to your broker adapter.
+
+    ```typescript
+    import type { TradeSignal } from "pump-anomaly";
+
+    // liveItems = the latest ParserItem[] from your Telegram parser
+    const trades: TradeSignal[] = await prodModel.plan(liveItems, getCandles);
+
+    for (const s of trades) {
+      console.log(
+        s.symbol,
+        s.direction,          // already inverted if squeezePolicy="invert"
+        s.action,             // "enter" | "tighten" | "invert"
+        s.exit.trailingTake,  // trailing take %, already tightened if action="tighten"
+        s.exit.hardStop,      // hard stop %
+        s.exit.impactHorizonMinutes, // max holding period
+      );
+
+      // Open the position — no if-statements about veto or inversion needed:
+      openPosition(
+        s.symbol,
+        s.direction,
+        { from: s.entryFromPrice, to: s.entryToPrice },
+        s.exit,
+      );
+    }
+    ```
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+## Complete End-to-End Example
+
+```typescript
+import { PumpMatrix, silentProgress } from "pump-anomaly";
+import type { ParserItem, GetCandles, ICandleData, TradeSignal } from "pump-anomaly";
+import ccxt from "ccxt";
+import * as fs from "fs";
+
+// ── 1. Build the getCandles adapter ──────────────────────────────────────────
+const exchange = new ccxt.binance({ enableRateLimit: true });
+await exchange.loadMarkets();
+
+const getCandles: GetCandles = async (symbol, interval, limit, sDate) => {
+  const rows = await exchange.fetchOHLCV(symbol, interval, sDate, limit);
+  return rows.map(([timestamp, open, high, low, close, volume]) => ({
+    timestamp, open, high, low, close, volume,
+  })) as ICandleData[];
+};
+
+// ── 2. Load history ───────────────────────────────────────────────────────────
+const history: ParserItem[] = JSON.parse(
+  fs.readFileSync("assets/parser-items.json", "utf8")
+);
+
+// ── 3. Train ──────────────────────────────────────────────────────────────────
+const model = await PumpMatrix.fit(history, getCandles, {
+  onProgress: silentProgress,
+});
+
+// ── 4. Check certification ────────────────────────────────────────────────────
+if (!model.certification.certified) {
+  console.error("Not certified:", model.certification.reasons);
+  process.exit(1);
+}
+
+// ── 5. Save ───────────────────────────────────────────────────────────────────
+fs.writeFileSync("assets/model-weights.json", model.save(), "utf8");
+
+// ── 6. Load in prod (skip training) ──────────────────────────────────────────
+const prodModel = PumpMatrix.load(
+  fs.readFileSync("assets/model-weights.json", "utf8")
+);
+
+// ── 7. Get live signals ───────────────────────────────────────────────────────
+const liveItems: ParserItem[] = [
+  { channel: "alpha_calls", symbol: "SOLUSDT", direction: "long", ts: Date.now() },
+];
+
+// plan() adds liquidation-cascade detection from pre-signal candles (no look-ahead):
+const trades: TradeSignal[] = await prodModel.plan(liveItems, getCandles);
+
+for (const s of trades) {
+  openPosition(
+    s.symbol,
+    s.direction,
+    { from: s.entryFromPrice, to: s.entryToPrice },
+    s.exit,
+  );
+}
+```
+
+---
+
+<Note>
+  **Fast path: `signals()` with no candles.** `model.signals(liveItems)` skips candle fetching entirely. Because no candles are available, the liquidation-cascade detector cannot run — every outcome is `"enter"`. Use this path when latency is critical and you are willing to accept that stop-hunt traps are not filtered at runtime. The trained exit parameters still apply.
+
+  ```typescript
+  // Synchronous, no network calls, cascade not evaluated:
+  const trades = prodModel.signals(liveItems);
+  ```
+</Note>
+
+<Tip>
+  The `DEFAULT_GRID` covers a broad search space suitable for most crypto assets. For asset-specific grids (HYPE, Solana, BTC, DOGE, and more), see [/guides/training](/guides/training) for the full grid rationale and per-asset `TrainGrid` configuration options.
 </Tip>

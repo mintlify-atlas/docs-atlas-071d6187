@@ -1,72 +1,94 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Pump Anomaly",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#6C3CE4",
+    "light": "#EDE8FF",
+    "dark": "#2A0F6B"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/tripolskypetr/pump-anomaly"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/tripolskypetr/pump-anomaly"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/detector-layers",
+              "concepts/exit-tensor",
+              "concepts/liquidation-cascade"
+            ]
+          },
+          {
+            "group": "Training",
+            "pages": [
+              "guides/training",
+              "guides/certification",
+              "guides/per-asset-grids",
+              "guides/meta-ledger"
+            ]
+          },
+          {
+            "group": "Production Usage",
+            "pages": [
+              "guides/live-trading",
+              "guides/backtesting",
+              "guides/signal-history",
+              "guides/backtest-kit-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Main Class",
+            "pages": [
+              "api/pump-matrix",
+              "api/trade-signal",
+              "api/signal-policy"
+            ]
+          },
+          {
+            "group": "Data Contracts",
+            "pages": [
+              "api/parser-item",
+              "api/get-candles",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Statistics & Utilities",
+            "pages": [
+              "api/statistics",
+              "api/meta-ledger",
+              "api/progress"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

@@ -1,0 +1,677 @@
+---
+title: "Statistics Functions: Sharpe, DSR, PBO, SPA, and Moment Stats"
+sidebarTitle: "Statistics"
+description: "Reference for pump-anomaly's exported pure statistical functions: sharpe, deflatedSharpe, probabilityOfBacktestOverfitting, realityCheckPValue, certifyStrategy, and moment statistics."
+---
+
+All statistics functions in `pump-anomaly` are **pure over arrays of per-trade returns** — they take plain `number[]` inputs, produce deterministic outputs, and have no external dependencies. They implement the full López de Prado / White / Hansen certification pipeline so you can distinguish a genuine edge from a brute-force grid-search artifact.
+
+---
+
+## Moment Statistics
+
+Four foundational statistics used throughout the DSR and certification pipeline.
+
+### `mean`
+
+```typescript
+mean(a: number[]): number
+```
+
+Returns the arithmetic mean of `a`. Returns `0` on an empty array.
+
+<ParamField path="a" type="number[]" required>
+  Array of per-trade returns (or any numeric series).
+</ParamField>
+
+---
+
+### `variance`
+
+```typescript
+variance(a: number[]): number
+```
+
+Returns the **sample variance** (denominator `n − 1`) computed via the **Welford online algorithm** for numerical stability. Avoids catastrophic cancellation that a naïve `Σ(x − mean)²` suffers when `mean >> spread`. Returns `NaN` if any element is non-finite, `0` for arrays shorter than 2.
+
+<ParamField path="a" type="number[]" required>
+  Array of per-trade returns.
+</ParamField>
+
+---
+
+### `stdev`
+
+```typescript
+stdev(a: number[]): number
+```
+
+Returns `Math.sqrt(variance(a))`.
+
+<ParamField path="a" type="number[]" required>
+  Array of per-trade returns.
+</ParamField>
+
+---
+
+### `skewness`
+
+```typescript
+skewness(a: number[]): number
+```
+
+Returns the **Fisher-Pearson sample skewness** — the third standardised central moment:
+
+```
+skewness = (1/n) · Σ ((xᵢ − mean) / stdev)³
+```
+
+Returns `0` for arrays shorter than 3, any non-finite element, or zero standard deviation.
+
+<ParamField path="a" type="number[]" required>
+  Array of per-trade returns.
+</ParamField>
+
+---
+
+### `kurtosis`
+
+```typescript
+kurtosis(a: number[]): number
+```
+
+Returns the **sample kurtosis** — the fourth standardised central moment. This is **not** excess kurtosis; a normal distribution has `kurtosis = 3`. Returns `3` for arrays shorter than 4 or a constant series.
+
+<ParamField path="a" type="number[]" required>
+  Array of per-trade returns.
+</ParamField>
+
+---
+
+## Sharpe Ratio
+
+### `sharpe`
+
+```typescript
+sharpe(returns: number[]): number
+```
+
+Returns the **per-trade Sharpe ratio** (no annualisation): `mean(returns) / stdev(returns)`.
+
+**Dust-floor protection.** The standard deviation is compared against a scale-relative floor before division: `dustFloor = max(|xᵢ|) × 1e-13` (≈ 500× machine epsilon). This prevents astronomically large Sharpe values when the standard deviation is indistinguishable from floating-point noise of the data — while correctly preserving a high Sharpe that arises from a genuinely small standard deviation relative to a large mean. An earlier threshold based on `|mean| × 1e-9` was wrong: it killed exactly those high-Sharpe cases.
+
+Returns `0` on an empty array or any non-finite element.
+
+<ParamField path="returns" type="number[]" required>
+  Array of per-trade returns (fractions, e.g. `0.02` = +2%).
+</ParamField>
+
+---
+
+## Normal Distribution
+
+Two helper functions used internally by the DSR and `minTrackRecordLength` calculations, and exported for standalone use.
+
+### `normalCdf`
+
+```typescript
+normalCdf(z: number): number
+```
+
+CDF of the standard normal distribution via the **Abramowitz-Stegun 7.1.26** rational approximation. Accurate to roughly 7 significant figures across the full real line.
+
+<ParamField path="z" type="number" required>
+  Z-score (standard normal variate).
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Probability `Φ(z) ∈ [0, 1]`.
+</ResponseField>
+
+---
+
+### `normalInv`
+
+```typescript
+normalInv(p: number): number
+```
+
+Inverse CDF (quantile function) of the standard normal — **Acklam 2003** rational approximation. Accuracy ~`1e-9` over `[1e-15, 1 − 1e-15]`. Returns `−Infinity` for `p ≤ 0`, `+Infinity` for `p ≥ 1`.
+
+<ParamField path="p" type="number" required>
+  Probability in `(0, 1)`.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  The z-score `z` such that `Φ(z) = p`.
+</ResponseField>
+
+---
+
+## Deflated Sharpe Ratio (DSR)
+
+The DSR corrects the observed Sharpe ratio for three sources of inflation: the number of configurations trialled (`nTrials`), the skewness and kurtosis of the return distribution, and the length of the track record. A raw `sharpe()` of 2.0 from a 500-config grid on 80 trades proves almost nothing; `deflatedSharpe` quantifies exactly how much it proves.
+
+### `expectedMaxSharpe`
+
+```typescript
+expectedMaxSharpe(varSR: number, nTrials: number): number
+```
+
+Returns the **expected maximum Sharpe ratio under the null hypothesis** (true edge = 0) when `nTrials` independent configurations are evaluated and each has Sharpe-estimate variance `varSR`. This is the "bar of randomness" — how high the best-of-N Sharpe would climb by pure luck:
+
+```
+E[max SR] ≈ √varSR · [(1 − γ) · Φ⁻¹(1 − 1/N) + γ · Φ⁻¹(1 − 1/(N·e))]
+```
+
+where γ is the Euler-Mascheroni constant. (López de Prado 2014.)
+
+<ParamField path="varSR" type="number" required>
+  Variance of Sharpe estimates across the `nTrials` configurations.
+</ParamField>
+<ParamField path="nTrials" type="number" required>
+  Number of configurations tried (grid size). Returns `0` for `nTrials < 1`.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  The expected maximum SR under the null — use this as `SR₀` in the DSR formula.
+</ResponseField>
+
+---
+
+### `deflatedSharpe`
+
+```typescript
+deflatedSharpe(
+  returns: number[],
+  nTrials: number,
+  varSRAcrossTrials: number,
+): number
+```
+
+Returns the **Deflated Sharpe Ratio**: the probability that the true Sharpe of the selected strategy exceeds the expected-max-of-noise bar `SR₀`, after correcting for skewness, kurtosis, and track-record length:
+
+```
+DSR = Φ( (SR − SR₀) · √(T − 1) / √(1 − skew · SR + (kurt − 1)/4 · SR²) )
+```
+
+- `SR` — `sharpe(returns)` of the selected (best) strategy.
+- `SR₀` — `expectedMaxSharpe(varSRAcrossTrials, nTrials)`.
+- `T` — `returns.length`.
+- Denominator accounts for non-normality (skew/excess kurtosis inflate the apparent Sharpe).
+
+Returns `p ∈ [0, 1]`. The certification threshold is `p ≥ 0.95`. Returns `0` on a non-finite result (fail-closed, not a false positive).
+
+<ParamField path="returns" type="number[]" required>
+  Per-trade returns of the **selected** (best) strategy.
+</ParamField>
+<ParamField path="nTrials" type="number" required>
+  Total number of configurations tried across all fit attempts. If a `MetaLedger` is provided to `fit()`, this becomes `effectiveTrials` — the sum across all historical fit attempts, not just the current grid.
+</ParamField>
+<ParamField path="varSRAcrossTrials" type="number" required>
+  Variance of Sharpe estimates across the candidate configurations in the current fit.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  DSR probability `∈ [0, 1]`. Values ≥ 0.95 pass the certification gate.
+</ResponseField>
+
+---
+
+## `minTrackRecordLength`
+
+```typescript
+minTrackRecordLength(returns: number[], alpha?: number): number
+```
+
+Returns the **minimum number of trades** needed for the observed Sharpe ratio to be statistically significant at significance level `alpha` (López de Prado):
+
+```
+minTRL = 1 + [1 − skew · SR + (kurt − 1)/4 · SR²] · (Z_{1-α} / SR)²
+```
+
+If `actualN < minTRL`, the sample is physically too small — any conclusion is premature. `certifyStrategy` fails the `actualN ≥ minTRL` gate when this condition is violated.
+
+Returns `Infinity` when `SR ≤ 0` (a losing strategy can never achieve a positive-edge significance test — the formula's `(z/SR)²` term would give an absurdly small value due to the sign flip on squaring).
+
+<ParamField path="returns" type="number[]" required>
+  Per-trade returns of the selected strategy.
+</ParamField>
+<ParamField path="alpha" type="number">
+  Significance level. Default: `0.05`.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Minimum trades required. Compare against `returns.length`; if `returns.length < minTRL`, the strategy cannot be certified regardless of its Sharpe.
+</ResponseField>
+
+---
+
+## Probability of Backtest Overfitting (PBO)
+
+### `probabilityOfBacktestOverfitting`
+
+```typescript
+probabilityOfBacktestOverfitting(perf: number[][]): number
+```
+
+Returns the **Probability of Backtest Overfitting** via **Combinatorially-Symmetric Cross-Validation (CSCV)** (López de Prado 2015).
+
+**How it works.** Given a performance matrix `perf[config][fold]`, the function enumerates all `C(S, S/2)` ways to split `S` folds into in-sample (IS) and out-of-sample (OOS) halves. For each split:
+
+1. Pick the best config by its mean IS performance.
+2. Measure that config's rank among all configs on OOS performance (using midranks to handle ties correctly).
+3. Convert the rank to logit space: `logit = log(ω / (1 − ω))` where `ω = (rank + 0.5) / nConfigs`.
+4. Count the split as "overfit" if `logit < 0` (IS-best landed in the bottom half OOS).
+
+`PBO = overfit / total`. Values near `0.5` indicate pure overfitting; values near `0` indicate that the IS-best config genuinely transfers to OOS.
+
+Returns `NaN` (not `0.5`!) if the number of folds is odd, fewer than 2, or `perf` is empty. A `NaN` result blocks certification — it is an honest "cannot evaluate" rather than a misleading signal.
+
+<ParamField path="perf" type="number[][]" required>
+  `perf[config][fold]` — performance metric for each configuration on each fold. Higher is better. Must have an even number of folds `≥ 2`.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  PBO ∈ `[0, 1]`. Values ≤ 0.10 pass the certification gate. `NaN` if inputs are invalid.
+</ResponseField>
+
+---
+
+## SPA / Reality Check
+
+### `realityCheckPValue`
+
+```typescript
+realityCheckPValue(
+  strategiesReturns: number[][],
+  opts?: { bootstraps?: number; pBlock?: number; seed?: number },
+): number
+```
+
+Returns the **SPA (Superior Predictive Ability) p-value** via a **stationary bootstrap** (White 2000, Hansen 2005, Politis-Romano 1994).
+
+**Null hypothesis:** the best of the `K` candidate strategies has no edge over a zero-return benchmark — the entire edge is explained by data-snooping across `K` configurations.
+
+The test statistic is `V = max_k √T · mean(returns_k)`. The bootstrap generates `B` resamples of the centred returns under H₀ and measures what fraction of bootstrap `V` values equal or exceed the observed `V`. A small p-value (≤ 0.05) rejects H₀ — the edge is not explained by searching alone.
+
+Uses `+1 / (B+1)` bias correction (Davison-Hinkley).
+
+<ParamField path="strategiesReturns" type="number[][]" required>
+  Array of return series, one per candidate configuration. All series should have the same length.
+</ParamField>
+<ParamField path="opts.bootstraps" type="number">
+  Number of bootstrap resamples. Default: `1000`.
+</ParamField>
+<ParamField path="opts.pBlock" type="number">
+  Block-break probability per step (mean block length = `1 / pBlock`). Default: `0.1` (mean block length 10).
+</ParamField>
+<ParamField path="opts.seed" type="number">
+  Seed for the `mulberry32` PRNG for reproducible results. Default: `12345`.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  SPA p-value ∈ `(0, 1]`. Values ≤ 0.05 pass the certification gate.
+</ResponseField>
+
+---
+
+### `stationaryBootstrapResample`
+
+```typescript
+stationaryBootstrapResample(
+  returns: number[],
+  pBlock: number,
+  rng: () => number,
+): number[]
+```
+
+Generates one **stationary bootstrap resample** of `returns` (Politis-Romano 1994). Preserves autocorrelation structure by resampling in geometrically-distributed blocks. An i.i.d. bootstrap on dependent return series would produce optimistic (too-low) p-values; block resampling corrects this.
+
+<ParamField path="returns" type="number[]" required>
+  The series to resample.
+</ParamField>
+<ParamField path="pBlock" type="number" required>
+  Probability of starting a new block at each step. Mean block length = `1 / pBlock`.
+</ParamField>
+<ParamField path="rng" type="() => number" required>
+  A uniform `[0, 1)` random number generator. Pass `mulberry32(seed)` for reproducibility.
+</ParamField>
+
+<ResponseField name="returns" type="number[]">
+  A resampled series of the same length as `returns`.
+</ResponseField>
+
+---
+
+### `mulberry32`
+
+```typescript
+mulberry32(seed: number): () => number
+```
+
+Returns a **seeded pseudo-random number generator** (mulberry32 algorithm). Used internally by `realityCheckPValue` and `stationaryBootstrapResample` to ensure bootstrap runs are deterministic and reproducible across test environments.
+
+<ParamField path="seed" type="number" required>
+  32-bit integer seed.
+</ParamField>
+
+<ResponseField name="returns" type="() => number">
+  A stateless closure that produces uniform `[0, 1)` values on each call.
+</ResponseField>
+
+```typescript
+import { mulberry32, stationaryBootstrapResample } from "pump-anomaly";
+
+const rng = mulberry32(42);
+const resampled = stationaryBootstrapResample(myReturns, 0.1, rng);
+```
+
+---
+
+## `certifyStrategy`
+
+`certifyStrategy` is the **composite five-barrier gate** that ties together DSR, PBO, SPA, minTRL, and the nested out-of-sample score. A strategy is `certified: true` only if it passes **all** barriers simultaneously.
+
+```typescript
+certifyStrategy(
+  inp: CertificationInput,
+  thresholds?: { dsr?: number; pbo?: number; spa?: number },
+): Certification
+```
+
+### `CertificationInput`
+
+```typescript
+interface CertificationInput {
+  /** per-trade returns of the selected (best) strategy */
+  selectedReturns: number[];
+  /** number of configurations tried */
+  nTrials: number;
+  /** variance of Sharpe estimates across trials (for the DSR bar) */
+  varSRAcrossTrials: number;
+  /** perf[config][fold] for PBO (CSCV) */
+  perfMatrix: number[][];
+  /** return series for all candidate configurations, for SPA */
+  candidateReturns: number[][];
+  /** unbiased nested-CV OOS score (null if not computed) */
+  nestedScore: number | null;
+}
+```
+
+<ParamField path="inp.selectedReturns" type="number[]" required>
+  Per-trade returns of the strategy that won IS model selection.
+</ParamField>
+<ParamField path="inp.nTrials" type="number" required>
+  Grid size (number of configurations trialled). Use `effectiveTrials` from `MetaLedger` to account for repeated `fit()` calls.
+</ParamField>
+<ParamField path="inp.varSRAcrossTrials" type="number" required>
+  Variance of all candidate Sharpe estimates — sets the expected-max-noise bar.
+</ParamField>
+<ParamField path="inp.perfMatrix" type="number[][]" required>
+  Full performance matrix for PBO. Rows = configs, columns = folds.
+</ParamField>
+<ParamField path="inp.candidateReturns" type="number[][]" required>
+  Return series for every candidate config — used for the SPA stationary bootstrap.
+</ParamField>
+<ParamField path="inp.nestedScore" type="number | null" required>
+  Unbiased nested-CV out-of-sample estimate (from `fit()`). Pass `null` to skip this barrier.
+</ParamField>
+<ParamField path="thresholds.dsr" type="number">
+  Minimum DSR to pass. Default: `0.95`.
+</ParamField>
+<ParamField path="thresholds.pbo" type="number">
+  Maximum PBO to pass. Default: `0.10`.
+</ParamField>
+<ParamField path="thresholds.spa" type="number">
+  Maximum SPA p-value to pass. Default: `0.05`.
+</ParamField>
+
+### `Certification` (return type)
+
+```typescript
+interface Certification {
+  certified: boolean;
+  dsr: number;              // ≥ 0.95 to pass
+  pbo: number;              // ≤ 0.10 to pass
+  spaPValue: number;        // ≤ 0.05 to pass
+  minTRL: number;           // actualN must be ≥ minTRL
+  actualN: number;          // returns.length
+  nestedScore: number | null; // must be > 0 if non-null
+  reasons: string[];        // human-readable failure reasons (empty when certified)
+}
+```
+
+<ResponseField name="certified" type="boolean">
+  `true` only when every barrier is passed. A `false` model should not trade.
+</ResponseField>
+<ResponseField name="dsr" type="number">
+  Deflated Sharpe Ratio. Must be ≥ threshold (default 0.95).
+</ResponseField>
+<ResponseField name="pbo" type="number">
+  Probability of Backtest Overfitting. Must be ≤ threshold (default 0.10).
+</ResponseField>
+<ResponseField name="spaPValue" type="number">
+  SPA / Reality Check p-value. Must be ≤ threshold (default 0.05).
+</ResponseField>
+<ResponseField name="minTRL" type="number">
+  Minimum track record length (trades) required for significance.
+</ResponseField>
+<ResponseField name="actualN" type="number">
+  Actual number of trades in `selectedReturns`.
+</ResponseField>
+<ResponseField name="nestedScore" type="number | null">
+  Unbiased nested-CV OOS score. Must be > 0 when non-null.
+</ResponseField>
+<ResponseField name="reasons" type="string[]">
+  Human-readable list of failed barriers. Empty when `certified: true`.
+</ResponseField>
+
+```typescript
+import { certifyStrategy } from "pump-anomaly";
+
+const cert = certifyStrategy(
+  {
+    selectedReturns: myReturns,
+    nTrials: 500,
+    varSRAcrossTrials: 0.04,
+    perfMatrix: foldPerf,
+    candidateReturns: allReturns,
+    nestedScore: 0.012,
+  },
+  { dsr: 0.95, pbo: 0.10, spa: 0.05 },
+);
+
+if (cert.certified) {
+  console.log("Edge is real — safe to deploy.");
+} else {
+  console.log("Rejected:", cert.reasons);
+}
+```
+
+---
+
+## Objective and Selection Functions
+
+These utilities from `src/objective.ts` shape the training objective and the winner-selection rule. They are exported from the package top level alongside the statistics functions.
+
+### `shrinkageExpectancy`
+
+```typescript
+shrinkageExpectancy(returns: number[], k?: number): number
+```
+
+The **primary training objective**: mean return shrunk toward zero on small samples.
+
+```
+score = mean(returns) · N / (N + k)
+```
+
+Without shrinkage, argmax over a grid would fall in love with a threshold that caught one fat outlier and call it an "ideal edge." The `k` parameter sets shrinkage strength: at `N = k` the score is halved relative to the asymptotic mean.
+
+<ParamField path="returns" type="number[]" required>
+  Per-trade returns for the candidate configuration.
+</ParamField>
+<ParamField path="k" type="number">
+  Shrinkage strength. Default: `5`. Larger values penalise small-sample configs more aggressively.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Shrinkage-adjusted mean return. Used as the CV fold score throughout `fit()`.
+</ResponseField>
+
+---
+
+### `winrate`
+
+```typescript
+winrate(returns: number[]): number
+```
+
+Fraction of positive returns. Exported for reporting; **not** used as the training objective (a high winrate with a black swan is the trap `shrinkageExpectancy` is designed to avoid).
+
+<ParamField path="returns" type="number[]" required>
+  Per-trade returns.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Win rate ∈ `[0, 1]`. Returns `0` on an empty array.
+</ResponseField>
+
+---
+
+### `percentile`
+
+```typescript
+percentile(arr: number[], p: number): number
+```
+
+The `p`-th quantile via **linear interpolation (type-7, matching NumPy)**. Non-finite values are silently dropped before computation — a single bad candle cannot corrupt a P95.
+
+<ParamField path="arr" type="number[]" required>
+  Numeric sample. Non-finite values are filtered out.
+</ParamField>
+<ParamField path="p" type="number" required>
+  Quantile in `[0, 1]`. `0.95` → P95, `0.5` → median.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Interpolated quantile value, or `0` on an empty (or all-non-finite) array.
+</ResponseField>
+
+---
+
+### `riskRewardStats`
+
+```typescript
+riskRewardStats(
+  trades: Array<{ pnl: number; hardStop: number }>,
+): RiskRewardStats
+```
+
+Computes **risk-reward statistics** per trade, where RR = `pnl / (hardStop / 100)` (realised PnL in units of the hard-stop risk). Trades with `hardStop ≤ 0` or non-finite `pnl` are skipped.
+
+<ParamField path="trades" type="Array<{ pnl: number; hardStop: number }>" required>
+  Array of trade results. `pnl` is a fraction (e.g. `0.02` = +2%); `hardStop` is a percentage (e.g. `1.5` = 1.5%).
+</ParamField>
+
+```typescript
+interface RiskRewardStats {
+  mean: number;   // mean RR across all trades
+  p95:  number;   // 95th percentile RR (positive tail)
+  p99:  number;   // 99th percentile RR
+  n:    number;   // number of trades in the sample
+}
+```
+
+<ResponseField name="mean" type="number">Mean RR (PnL in units of risk).</ResponseField>
+<ResponseField name="p95" type="number">P95 RR — how good the upper tail is.</ResponseField>
+<ResponseField name="p99" type="number">P99 RR — extreme upper tail.</ResponseField>
+<ResponseField name="n" type="number">Valid trade count.</ResponseField>
+
+---
+
+### `pnlStats`
+
+```typescript
+pnlStats(pnls: number[]): PnlStats
+```
+
+**Outlier-robust PnL statistics**: mean plus median and percentiles so a single fat winner (or a single catastrophic loss) does not misrepresent the system's edge. Non-finite values are filtered before all calculations.
+
+```typescript
+interface PnlStats {
+  mean:   number;   // arithmetic mean (sensitive to outliers — for comparison)
+  median: number;   // 50th percentile (outlier-immune centre)
+  p5:     number;   // 5th percentile (lower tail — how bad the worst 5% are)
+  p95:    number;   // 95th percentile (upper tail)
+  p99:    number;   // 99th percentile (extreme upper tail)
+  n:      number;   // number of valid trades
+}
+```
+
+<ParamField path="pnls" type="number[]" required>
+  Per-trade PnL fractions. Non-finite values are dropped silently.
+</ParamField>
+
+---
+
+### `standardError`
+
+```typescript
+standardError(foldScores: number[]): number
+```
+
+Standard error of the mean across CV fold scores: `SE = stdev(foldScores) / √n`. Uses sample standard deviation (denominator `n − 1`). Returns `0` for fewer than 2 folds (spread is not estimable).
+
+<ParamField path="foldScores" type="number[]" required>
+  Per-fold objective scores for one configuration.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  SE of the mean fold score — used to define the 1-SE corridor in `oneStandardErrorSelect`.
+</ResponseField>
+
+---
+
+### `oneStandardErrorSelect`
+
+```typescript
+oneStandardErrorSelect<T>(
+  entries: T[],
+  scoreOf: (e: T) => number,
+  foldsOf: (e: T) => number[],
+  isSimpler: (a: T, b: T) => boolean,
+  seMultiplier?: number,
+): T | null
+```
+
+Implements the **one-standard-error rule** (Breiman 1984) against winner's curse in grid search.
+
+**The problem.** `argmax` over N noisy CV scores is biased upward by ≈ `σ · √(2 · ln N)` even when the true edge is zero. The larger the grid, the more the top score is inflated by luck.
+
+**The rule.** Select the most *conservative* configuration whose score falls within 1 SE of the maximum — a gap within 1 SE is statistically indistinguishable from noise, so robustness beats luck. "More conservative" is defined by the caller-supplied `isSimpler` comparator (smaller hard stop, shorter holding horizon, softer cascade reaction).
+
+<ParamField path="entries" type="T[]" required>
+  All candidate configurations.
+</ParamField>
+<ParamField path="scoreOf" type="(e: T) => number" required>
+  Extracts the mean CV score for a candidate.
+</ParamField>
+<ParamField path="foldsOf" type="(e: T) => number[]" required>
+  Extracts the per-fold scores for a candidate (used to compute SE of the winner).
+</ParamField>
+<ParamField path="isSimpler" type="(a: T, b: T) => boolean" required>
+  Returns `true` when `a` is more conservative than `b`. Candidates with `score ≥ max − SE` are compared with this; the most conservative within the corridor is returned.
+</ParamField>
+<ParamField path="seMultiplier" type="number">
+  Multiplier applied to SE before computing the corridor. Default: `1` (classic Breiman). Values `> 1` widen the corridor (more conservative selection).
+</ParamField>
+
+<ResponseField name="returns" type="T | null">
+  The selected configuration, or `null` if `entries` is empty.
+</ResponseField>
+
+<Note>
+All functions documented on this page — `mean`, `variance`, `stdev`, `skewness`, `kurtosis`, `sharpe`, `normalCdf`, `normalInv`, `expectedMaxSharpe`, `deflatedSharpe`, `minTrackRecordLength`, `probabilityOfBacktestOverfitting`, `stationaryBootstrapResample`, `mulberry32`, `realityCheckPValue`, `certifyStrategy`, `shrinkageExpectancy`, `winrate`, `percentile`, `riskRewardStats`, `pnlStats`, `standardError`, and `oneStandardErrorSelect` — are exported directly from the `pump-anomaly` package top level.
+</Note>

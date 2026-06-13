@@ -1,0 +1,117 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Pump Anomaly",
+  "projectDescription": "A TypeScript library for detecting synchronized cryptocurrency pump signals from Telegram channels, with author-cluster deduplication, path-aware exit replay, liquidation-cascade detection, and a five-barrier statistical certification system to prevent brute-force overfitting.",
+  "theme": "aspen",
+  "primaryColor": "#6C3CE4",
+  "lightColor": "#EDE8FF",
+  "darkColor": "#2A0F6B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/detector-layers",
+              "concepts/exit-tensor",
+              "concepts/liquidation-cascade"
+            ]
+          },
+          {
+            "group": "Training",
+            "pages": [
+              "guides/training",
+              "guides/certification",
+              "guides/per-asset-grids",
+              "guides/meta-ledger"
+            ]
+          },
+          {
+            "group": "Production Usage",
+            "pages": [
+              "guides/live-trading",
+              "guides/backtesting",
+              "guides/signal-history",
+              "guides/backtest-kit-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Main Class",
+            "pages": [
+              "api/pump-matrix",
+              "api/trade-signal",
+              "api/signal-policy"
+            ]
+          },
+          {
+            "group": "Data Contracts",
+            "pages": [
+              "api/parser-item",
+              "api/get-candles",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Statistics & Utilities",
+            "pages": [
+              "api/statistics",
+              "api/meta-ledger",
+              "api/progress"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Author-cluster deduplication via union-find to distinguish real capital inflow from single-actor multi-channel manipulation",
+    "Path-aware exit replay on 1m OHLC candles — labels training data from your actual prod exit, not close-to-close",
+    "Liquidation-cascade detection (symmetric long/short): volZ + squeezePressure with configurable policy (none / tighten / veto / invert)",
+    "Five-barrier statistical certification (DSR, PBO, SPA, minTRL, nested-CV OOS) to reject brute-force artifacts",
+    "Exit tensor [mode][channel][symbol][direction][volRegime] with hierarchical fallback — each source/asset/direction gets its own trained exit",
+    "Meta-overfitting guard (MetaLedger): cadence gate + family-wise DSR correction across repeated fit() attempts",
+    "One-standard-error winner selection (Breiman) over time-series K-fold CV to prefer robust configurations over lucky outliers",
+    "Stationarity window — rolling author-matrix over a configurable recent window to avoid regime drift on long histories",
+    "Per-asset tuned grids for 15 cryptocurrencies (BTC to Fartcoin) in config/",
+    "538 tests across 52 test files including e2e noise-rejection and adversarial statistics tests"
+  ],
+  "publicApiSurface": [
+    "PumpMatrix.fit(history, getCandles, opts?) → Promise<PumpMatrix>",
+    "PumpMatrix.load(json) → PumpMatrix",
+    "model.signals(items, policy?) → TradeSignal[]",
+    "model.plan(items, source, policy?) → Promise<TradeSignal[]>",
+    "model.backtest(items, source, policy?) → Promise<BacktestSignal[]>",
+    "model.planFor(symbol, dir, channel, candles, policy?) → TradeSignal | null",
+    "model.planForAt(symbol, dir, channel, candles, ts, policy?) → BacktestSignal | null",
+    "model.explain(items) → full report",
+    "model.save() → string",
+    "model.dump(asString?) → SignalRecord[] | string",
+    "model.certification → Certification",
+    "model.reliable, model.confidence, model.labeling, model.riskReward, model.pnl",
+    "predict(parserItems, config?) → PredictionResult",
+    "train(history, getCandles, opts?) → Promise<TrainResult>",
+    "replayExit(candles, params) → ReplayResult",
+    "volumeZScore / squeezePressure / volumeFeatures / volRegimeOf",
+    "shrinkageExpectancy / oneStandardErrorSelect / pnlStats / riskRewardStats",
+    "sharpe / deflatedSharpe / probabilityOfBacktestOverfitting / realityCheckPValue / certifyStrategy",
+    "emptyLedger / recordAttempt / canRefit / effectiveTrials",
+    "stdoutProgress / silentProgress",
+    "DEFAULT_GRID / DEFAULT_CONFIG / DEFAULT_VIABILITY / DEFAULT_POLICY"
+  ]
+}

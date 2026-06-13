@@ -1,0 +1,220 @@
+---
+title: "Train a Pump Anomaly Model with Time-Series K-Fold CV"
+sidebarTitle: "Training"
+description: "Train PumpMatrix with grid search, expanding-window K-fold cross-validation, and one-standard-error winner selection to avoid overfitting on small samples."
+---
+
+`PumpMatrix.fit()` tunes detector thresholds **and** production-exit parameters in a single grid search, validated by time-series K-fold (expanding window). Labels come from an exact replay of your prod exit on 1-minute candles — stop hunts are marked as losses because the OHLC path shows the wick that hit your hard stop, even when the closing price was fine. This page explains the key mechanisms that make the training process honest: the shrinkage objective, the 1-SE winner selection rule, nested cross-validation, and the reliability report.
+
+---
+
+## `PumpMatrix.fit()` signature
+
+The full `TrainOptions` interface from `src/train.ts`:
+
+```typescript
+interface TrainOptions {
+  grid?: Partial<TrainGrid>;
+  folds?: number;                       // K-fold folds, default 4
+  shrinkageK?: number;                  // objective shrinkage strength, default 5
+  maxBurstWindowMs?: number;            // burst window ceiling
+  reliability?: Partial<ReliabilityConfig>;
+  mode?: "auto" | "matrix" | "single"; // entry-selection mode
+  viability?: Partial<ViabilityConfig>; // matrix-viability thresholds
+  onProgress?: ProgressFn;             // defaults to a stdout bar
+  policy?: SignalPolicy;               // allowed outcomes, baked into the model
+  selection?: Partial<SelectionConfig>; // SE corridor + nested-CV (see selection.ts)
+  metaLedger?: MetaLedgerState;        // optional family-wise correction
+}
+```
+
+`fit` returns a trained model: `model.save()` serializes it to a JSON string, and `PumpMatrix.load(json)` restores it without retraining.
+
+---
+
+## `DEFAULT_GRID`
+
+The asset-agnostic default grid from `src/train.ts`. All axes are searched empirically with no hard-coded analytical math:
+
+```typescript
+const DEFAULT_GRID = {
+  // detector (authorship matrix)
+  windowK:          [2, 3, 5],
+  minClusters:      [2, 3],
+  jaccardThreshold: [0.3, 0.4],              // 0.2 almost never won — dropped to shrink the grid
+  lagPeakThreshold: [0.4, 0.5],             // 0.6 rarely better — dropped to shrink the grid
+  // prod exit (label set by replay)
+  trailingTake:         [0.5, 1.0, 2.0],
+  hardStop:             [1.0, 2.0, 3.0],
+  stalenessSinceProfit: [0.5, 1.0, 2.0],   // profit threshold that arms the staleness exit — searched, not fixed
+  stalenessSinceMinutes:[60, 120, 240],     // minutes without a new high before a staleness exit
+  staleMinutes:         [60, 240, 720],     // impact horizon: 1h / 4h / 12h (24h rarely optimal for short pumps)
+  // liquidation-cascade detector
+  volZThreshold:    [1.5, 2.5],            // when volume is anomalous
+  squeezePolicy:    ["none", "tighten", "veto", "invert"],
+  squeezeThreshold: [0.55, 0.7],
+  volBaselineWindow:[20],
+  cascadeWindowMinutes: [15, 30, 60],      // cascade-detection window — NOT the holding horizon
+  // stationarity window (long horizon)
+  stationarityWindowMs: [
+    7  * 24 * 3600_000,   // 1 week
+    14 * 24 * 3600_000,   // 2 weeks
+    28 * 24 * 3600_000,   // 4 weeks
+    56 * 24 * 3600_000,   // 8 weeks
+  ],
+};
+```
+
+Per-asset grids override individual axes of this default — see the [Per-Asset Grids](/guides/per-asset-grids) guide.
+
+---
+
+## Objective Function
+
+The CV objective is **shrinkage-expectancy**, from `src/objective.ts`:
+
+```typescript
+function shrinkageExpectancy(returns: number[], k = 5): number {
+  const n = returns.length;
+  if (n === 0) return 0;
+  const mean = returns.reduce((s, r) => s + r, 0) / n;
+  return mean * (n / (n + k));
+}
+```
+
+The formula is `score = mean(returns) × N / (N + k)`. At `N = k` (default 5), the contribution is cut in half regardless of how high the mean is. The purpose is direct: without shrinkage, the grid would happily find a degenerate threshold that captured exactly one fat outlier and reported a perfect "edge." Shrinkage toward zero on small samples prevents falling in love with that single lucky trade. As `N` grows, the factor approaches 1 and the mean dominates.
+
+`shrinkageK` (default 5) is the strength parameter. Noisy or fat-tailed assets like Fartcoin and HYPE use `shrinkageK: 7–8` in their per-asset grids to demand more trades before trusting a high mean.
+
+---
+
+## One-Standard-Error Winner Selection
+
+`fit` does **not** pick the configuration with the highest CV score. Instead it applies the **one-standard-error rule** (Breiman 1984), implemented in `src/objective.ts`:
+
+```typescript
+function oneStandardErrorSelect<T>(
+  entries: T[],
+  scoreOf: (e: T) => number,
+  foldsOf: (e: T) => number[],
+  isSimpler: (a: T, b: T) => boolean,
+  seMultiplier = 1,
+): T | null {
+  // ... find the maximum, compute SE from its fold scores,
+  // then pick the most conservative entry within 1 SE of the maximum
+}
+```
+
+**Why argmax is wrong.** The maximum of N noisy CV estimates is biased upward by approximately `σ · √(2 · ln N)` even when the true edge is exactly zero. With a grid of thousands of configurations this inflation is substantial — the winner is the luckiest configuration, not the best one.
+
+**The 1-SE rule.** A difference within 1 SE of the maximum is not statistically significant (it is inside the measurement noise). Among all configurations whose score falls within 1 SE of the maximum, the rule picks the **most conservative** one. This way a larger grid makes the result *more* robust rather than less, because the extra configurations provide more coverage of the conservative end of the corridor.
+
+**Conservatism ordering** is defined in `src/selection.ts` via a lexicographic key:
+
+```typescript
+function conservatismKey(exit: ExitParams, cvScore: number): number[] {
+  return [
+    exit.hardStop,           // 1) smaller risk-per-trade
+    exit.staleMinutes,       // 2) shorter exposure
+    cascadeAggressionOf(exit.squeezePolicy), // 3) softer cascade reaction
+    -cvScore,                // 4) tiebreak: higher score wins
+  ];
+}
+```
+
+Cascade aggression order: `ignore ≈ none (0) < tighten (1) < veto (2) < invert (3)`.
+
+---
+
+## Nested CV
+
+Nested CV is controlled by `selection.nestedOuterFolds` (default 4). It gives an **unbiased out-of-sample estimate** of the chosen configuration stored in `model.meta.nestedScore` — an honest "what to expect in prod" without winner's curse.
+
+<Accordion title="How nested CV works">
+The outer loop divides the labeled data into `K` time-ordered blocks. On each outer fold:
+1. The inner loop runs the full 1-SE selection on the training slice.
+2. The selected configuration is evaluated on the held-out test slice.
+3. The mean of all held-out scores becomes `nestedScore`.
+
+**Crucially**, model selection still uses the full-data 1-SE rule above. Nested CV only *evaluates* the selected configuration; it does not change which configuration is chosen. If `nestedScore ≤ 0`, the statistical certificate (`certified`) will fail the fifth barrier.
+</Accordion>
+
+Progress ticks on every outer fold — the terminal never goes silent for more than one fold's worth of time. On 3 months of data, full grid + 4 nested outer folds typically takes around 50 seconds.
+
+---
+
+## Training Reliability
+
+`reliability` answers "did training have enough stable, significant data?" It is computed from `src/reliability.ts` and is independent of the statistical certificate.
+
+```
+confidence = support × stability × significance   (each in [0, 1])
+reliable   = confidence ≥ 0.6 AND totalN ≥ 40
+```
+
+| Axis | Grows when |
+|---|---|
+| `support` | more trades — saturating function `N / (N + 30)` |
+| `stability` | edge holds in every fold, not just one |
+| `significance` | edge is statistically ≠ 0 (t-test against zero) |
+
+The three axes multiply: a model with 200 trades but all concentrated in one fold still has low `stability`, and therefore low `confidence`. Read the values from the model:
+
+```typescript
+model.reliable;      // boolean — enough stable, significant data
+model.confidence;    // 0..1   — overall trust score
+// model.meta also carries: support, stability, significance, totalSamples
+```
+
+`reliable: false` means the library still works and will produce signals, but it honestly warns you that the thresholds were tuned on thin or unstable data. As data grows, all three axes grow, `confidence → 1`, and `reliable` flips to `true` without any code changes. A single-channel dataset → empty authorship matrix → `reliable: false` by construction for matrix mode, but single mode still produces tradeable signals.
+
+Thresholds (`supportK: 30`, `confidenceThreshold: 0.6`, `minN: 40`) are configurable via `reliability` in `fit`.
+
+---
+
+## Labeling Diagnostics
+
+When a `fit` produces `totalSamples: 0` the model is otherwise silent — "no data" and "no entries" look identical. `model.labeling` makes it speak:
+
+```typescript
+model.labeling;
+// {
+//   candidates: number;          // unique bursts seen
+//   outcomes: {                  // only non-zero outcomes present
+//     ok?: number;               // labeled, has an entry
+//     "adapter-error"?: number;  // getCandles threw (look-ahead guard / gap / symbol)
+//     "no-candles"?: number;     // getCandles returned empty (symbol/range gave nothing)
+//     "no-entry"?: number;       // candles exist but no exit-set entered the zone
+//   };
+//   errors: Record<string, number>; // unique getCandles exception messages → count
+// }
+```
+
+| Outcome | What to fix |
+|---|---|
+| `adapter-error` | `getCandles` threw — check for look-ahead guard hit, data gap, or unknown symbol |
+| `no-candles` | `getCandles` returned empty — check symbol name and date range |
+| `no-entry` | Candles exist but price never touched the entry zone — may be acceptable |
+| `ok` | Labeled successfully — has at least one entry |
+
+`labeling.errors` carries the exact thrown message deduped (e.g. `{ "ccxt: symbol not found": 32 }`), so you can fix the exact `getCandles` error text rather than guessing.
+
+<Tip>
+`fit` writes a progress bar to stdout by default with three phases: `label` (slow per-candle labeling, IO-bound), `score` (grid scoring from cache), and `nested` (one tick per outer nested-CV fold). To silence it or replace with a custom handler:
+
+```typescript
+import { silentProgress } from "pump-anomaly";
+
+// suppress output entirely:
+await PumpMatrix.fit(history, getCandles, { onProgress: silentProgress });
+
+// custom progress handler:
+await PumpMatrix.fit(history, getCandles, {
+  onProgress: (e) => myLogger.info(`${e.phase} ${e.done}/${e.total} — ${e.label}`),
+});
+```
+</Tip>
+
+<Warning>
+The serialized params format is **version 3**. Models saved from earlier versions (v1 or v2) will throw `unsupported params version` on `PumpMatrix.load()` — the exit tensor structure is incompatible. There is no migration path; retrain from history.
+</Warning>

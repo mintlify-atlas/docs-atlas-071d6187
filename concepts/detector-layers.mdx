@@ -1,0 +1,184 @@
+---
+title: "Detector Layer Architecture: From Raw Events to Signals"
+sidebarTitle: "Detector Layers"
+description: "Deep dive into pump-anomaly's five internal processing layers: lag self-tuning, Jaccard screening, lag cross-correlation, author clustering, and burst early warning."
+---
+
+The matrix-mode pipeline is a five-stage funnel. Raw `ParserItem` events enter the top; by the bottom, only synchronous bursts from genuinely independent author clusters survive and become `action: "open"` signals. Each stage has a single, well-defined job. None of them contain magic thresholds baked into logic — every parameter is a grid axis exposed for training.
+
+This page covers the internals. For the high-level picture of how the pipeline fits into the full detection flow and what entry-selection modes do, see [How It Works](/concepts/how-it-works).
+
+---
+
+## Layer 1 — selfTuneLag
+
+`selfTuneLag` estimates the characteristic lag τ between sibling channels without any hand-tuned constants. It answers the question: "how many minutes apart do echo channels typically fire?"
+
+**What it computes.** For every pair of events on the same `(symbol, direction)` key from *different* channels, it records the positive delay `Δ = t_b − t_a`. These delays are binned into a 24-bin log-histogram over a 6-hour horizon. Random pairs produce a roughly flat histogram; sibling channels produce a sharp peak at a small lag. The center of the modal bin is τ.
+
+**Key parameters:**
+- Clamps the result to `[30 s, 60 min]` regardless of what the histogram says.
+- Returns a 15-minute default when fewer than 8 pairwise delays are observed (not enough data to form a peak).
+
+**Why it's needed.** The burst window `window = windowK × τ` that every downstream layer uses cannot be a fixed constant — fast assets (HYPE, Fartcoin) have sibling lags of seconds; slow assets (BTC, ETH) have lags of tens of minutes. A fixed window either misses slow echoes or creates false positives on fast assets. Self-tuning eliminates this.
+
+```ts
+import { selfTuneLag } from "pump-anomaly";
+
+const tau = selfTuneLag(tbl); // tbl: EventTable built from ParserItems
+// tau is in ms, clamped to [30_000, 3_600_000]
+```
+
+---
+
+## Layer 2 — jaccardScreen
+
+`jaccardScreen` is a coarse sieve that discards channel pairs with no meaningful co-occurrence before the more expensive cross-correlation step runs.
+
+**What it computes.** For every pair of channels `(a, b)`, it uses a two-pointer sweep over each shared `(symbol, direction)` key to count matched events — events from each channel that have a partner in the other channel within `|Δ| ≤ window`. The symmetrized Jaccard score is `2 × matched / total`.
+
+**Inputs and outputs.**
+- Input: `EventTable`, burst window (ms), `jaccardThreshold`.
+- Output: `Edge[]` — pairs whose Jaccard score meets or exceeds the threshold.
+
+**Key parameter:** `jaccardThreshold` (default `0.3`). A pair must share at least 30% of its events inside the window to pass. Grid values: `[0.3, 0.4]`.
+
+**Why it's needed.** `lagXCorr` is O(N²) per pair. Running it over every possible channel combination is expensive. Jaccard is O(N log N) after sorting and eliminates the long tail of unrelated pairs cheaply.
+
+```ts
+import { jaccardScreen, jaccardPair } from "pump-anomaly";
+
+// sieve all pairs:
+const edges = jaccardScreen(tbl, window, 0.3);
+
+// score a specific pair:
+const score = jaccardPair(tbl, "channelA", "channelB", window);
+```
+
+---
+
+## Layer 3 — lagXCorr
+
+`lagXCorr` converts undirected Jaccard edges into directed "who follows whom" relationships and rejects pairs whose correlation peak is too broad to be meaningful.
+
+**What it computes.** For each Jaccard-screened pair `(a, b)`, it collects signed delays `Δ = t_b − t_a` between nearest-neighbor events on shared keys. A narrow peak clustered around a small positive or negative lag means one channel consistently follows the other. A flat, smeared distribution means the co-occurrence was coincidental.
+
+Sharpness is measured as `peakShare = |deltas within peakWindow| / total`. If `peakShare < lagPeakThreshold`, the edge is dropped. The sign of the median delay determines the leader: positive median → `a` leads `b`; negative → `b` leads `a`.
+
+**Inputs and outputs.**
+- Input: `EventTable`, `Edge[]` from jaccardScreen, `lagPeakThreshold`, `peakWindow` (= `windowK × τ`).
+- Output: `DirectedEdge[]` — each with `leader`, `follower`, `lag` (modal |delay| in ms), and `peakShare`.
+
+**Key parameter:** `lagPeakThreshold` (default `0.5`). Grid values: `[0.4, 0.5]`. The peak window for measuring sharpness uses the full `windowK × τ` burst window, not bare τ — a sibling with a lag slightly above τ would otherwise be falsely dropped.
+
+**Why it's needed.** Jaccard is symmetric and doesn't tell you about direction or quality. `lagXCorr` upgrades each passing edge from "these channels co-occur" to "A reliably precedes B by ~N minutes" — the raw material for the union-find clustering step.
+
+```ts
+import { lagXCorr } from "pump-anomaly";
+
+const directed = lagXCorr(tbl, edges, 0.5, window);
+// directed[0].leader, directed[0].follower, directed[0].lag, directed[0].peakShare
+```
+
+---
+
+## Layer 4 — clusterAuthors
+
+`clusterAuthors` turns the directed edge graph into an author identity map using union-find (connected components).
+
+**What it computes.** Every `DirectedEdge` says "these two channels belong to the same author." Union-find merges them into the same cluster. Path compression keeps subsequent lookups O(α). The result is a `Map<channel, clusterId>` where channels with the same id are operated by the same author.
+
+**Inputs and outputs.**
+- Input: `string[]` of channel names, `DirectedEdge[]` from lagXCorr.
+- Output: `AuthorMap` — `Map<string, number>`.
+
+**Why it's needed.** A single actor running 10 channels should count as 1 independent voice, not 10. Without deduplication, any single-actor manipulation campaign with enough channels would trivially pass the `minClusters` threshold in `earlyWarning` and produce false matrix signals.
+
+```ts
+import { clusterAuthors } from "pump-anomaly";
+
+const authors: AuthorMap = clusterAuthors(tbl.channels, directed);
+// authors.get("channelA") === authors.get("channelB") → same author
+```
+
+---
+
+## Layer 5 — earlyWarning
+
+`earlyWarning` fires a burst signal when enough **independent** author clusters converge on the same ticker within the burst window. This is the final gate: it deduplicates echo channels and counts only distinct authors.
+
+**What it computes.** For each `(symbol, direction)` key, it runs a sliding window over sorted events. For each window position `[lo, hi]`, it counts the number of distinct author cluster IDs (not raw channels) among events in the slice. When `clusters.size >= minClusters`, a candidate verdict is generated. The best candidate (by `confidence`) becomes the output signal.
+
+**Confidence formula:**
+
+```
+confidence = dedup × fill
+
+dedup = clusters / channels       // 1 = all sources independent, <1 = some echo channels
+fill  = min(slice.length / (minClusters × 2), 1)  // saturates with more sources
+```
+
+**Key parameter:** `minClusters` (default `2`). Grid values: `[2, 3]`. This is the minimum number of independent author clusters needed for a matrix signal.
+
+**Why it's needed.** A burst of 5 events from a single actor across 5 channels produces `clusters.size = 1` → skip. A burst of 3 events from 3 different authors produces `clusters.size = 3` → open. Without this layer, manipulators could flood the matrix with echo channels.
+
+```ts
+import { earlyWarning } from "pump-anomaly";
+
+const verdicts = earlyWarning(tbl, authors, cfg, tau);
+const signals  = verdicts.filter(v => v.action === "open");
+```
+
+---
+
+## Single-Channel Mode
+
+When only one channel is present — or when matrix viability fails in `auto` mode — the matrix pipeline is bypassed entirely. `singleChannelSignals` converts every normalized event directly into a `PumpVerdict` with `action: "open"` and `source: "single"`.
+
+There is no Jaccard sieve, no cross-correlation, no clustering. The trained exit plan (resolved from the single-mode cells of the exit tensor) decides the outcome of each entry.
+
+```ts
+import { singleChannelSignals } from "pump-anomaly";
+
+const verdicts = singleChannelSignals(tbl, cfg, tau);
+// every event becomes an entry; trained exit decides the outcome
+```
+
+---
+
+## Exported Layer Functions
+
+All five matrix-mode layers plus the single-channel fallback are exported from the package for use in custom pipelines or testing:
+
+```typescript
+import {
+  selfTuneLag,
+  jaccardScreen,
+  jaccardPair,
+  lagXCorr,
+  clusterAuthors,
+  earlyWarning,
+  singleChannelSignals,
+} from "pump-anomaly";
+```
+
+The internal `EventTable` is built from `ParserItem[]` via `buildTable` or `buildWindowedTable` (also exported):
+
+```typescript
+import { buildTable, buildWindowedTable } from "pump-anomaly";
+
+const tbl = buildTable(events);
+const windowedTbl = buildWindowedTable(events, anchorTs, stationarityWindowMs);
+```
+
+`buildWindowedTable` restricts the table to events within the stationarity window ending at `anchorTs`. Pass `Infinity` for `stationarityWindowMs` to use the whole history.
+
+<Tip>
+  **`modeReason` diagnostic.** After `predict()` or any `model` method, `result.viability.reason` (and `model.modeReason` on a trained model) gives a plain-English explanation of why `auto` chose matrix or single. Examples:
+
+  - `"auto → single: one channel — correlation impossible"`
+  - `"auto → matrix: 3 strong edges, overlap 5, clusters >1: 2"`
+  - `"auto → single: no events with shared overlap (maxShared 1 < 3) — overlap is noise"`
+
+  This is the first place to look when a signal is missing or when you expect matrix but get single.
+</Tip>

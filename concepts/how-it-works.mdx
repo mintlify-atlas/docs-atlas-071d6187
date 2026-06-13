@@ -1,0 +1,158 @@
+---
+title: "How Pump Anomaly Detects Real Crypto Pump Signals"
+sidebarTitle: "How It Works"
+description: "A walkthrough of pump-anomaly's five-layer detection pipeline, entry-selection modes, and how training labels are generated from path-aware exit replay."
+---
+
+`pump-anomaly` is a black box for detecting **synchronized pump signals** in a stream of Telegram trading recommendations and turning that detection into a ready-to-execute trade plan. It solves three problems at once: separating real capital inflow (several independent authors hitting the same ticker in sync) from single-actor manipulation across anonymous channels, separating a genuine pump from a stop-hunting trap (a liquidation cascade that wipes out leveraged longs or shorts), and producing a trade plan with trained exit parameters tuned per source. All three decisions — detect, classify the cascade, resolve the exit — are made inside the library. Prod code just executes `s.direction` with `s.exit`.
+
+---
+
+## The Detection Pipeline
+
+The core of matrix mode is a five-layer signal processing chain. Each layer narrows the candidate set, passing only what the next layer needs.
+
+<Steps>
+  <Step title="selfTuneLag">
+    Estimates the characteristic lag τ between sibling channels from the histogram of pairwise delays. No magic constants — the burst window is derived from τ. See [Detector Layers](/concepts/detector-layers) for the full algorithm.
+  </Step>
+  <Step title="jaccardScreen">
+    Coarse Jaccard similarity sieve over a sliding window of raw timestamps. Discards channel pairs whose co-occurrence is too sparse to investigate further.
+  </Step>
+  <Step title="lagXCorr">
+    Directed cross-correlation graph of "who follows whom." A sharp peak in the delay distribution confirms a sibling relationship; a smeared background is dropped.
+  </Step>
+  <Step title="clusterAuthors">
+    Union-find merges every channel belonging to the same author into one cluster. An author running ten channels still counts as one independent voice.
+  </Step>
+  <Step title="earlyWarning">
+    Counts independent clusters (not raw channels) inside the sliding burst window. A burst from `minClusters` or more distinct authors fires an `action: "open"` verdict.
+  </Step>
+</Steps>
+
+All five layers are computed over the [stationarity window](#stationarity-window). In single mode the matrix isn't built at all — every post becomes an entry directly via `singleChannelSignals`. See [Detector Layers](/concepts/detector-layers) for a full deep-dive into each layer.
+
+---
+
+## Entry-Selection Modes
+
+The mode controls the **entry condition**, but the exit is not shared — it is tuned separately per cell of the exit tensor regardless of mode.
+
+| Mode | Entry condition | When used |
+|---|---|---|
+| `matrix` | Synchronous burst across ≥ `minClusters` independent author clusters | 2+ viable channels with a real correlation |
+| `single` | Every post is an entry; trained exit decides the outcome | 1 channel or low matrix viability |
+| `auto` | `matrix` if viable and the matrix produced a signal; otherwise `single` | Default |
+
+```ts
+predict(items, { mode: "auto" });    // default
+predict(items, { mode: "matrix" });  // force correlation
+predict(items, { mode: "single" });  // force fallback
+
+// result.usedMode   — which mode actually ran
+// result.viability  — why: { viable, maxSharedEvents, strongEdges, multiChannelClusters, reason }
+```
+
+`auto` is the safe choice for a production pipeline: it falls back to single rather than emitting a false signal from a noisy two-channel coincidence. The `usedMode` and `viability` fields give you a machine-readable explanation of which branch was taken.
+
+---
+
+## Matrix Viability
+
+Two channels do **not** guarantee matrix mode. If their overlap is noisy — Jaccard crossed the threshold on one or two events, no sharp edges, a trivial graph — `viability.viable` is `false` and `auto` falls back to single rather than emitting a false signal. The strict default criterion (`DEFAULT_VIABILITY`) requires all four conditions simultaneously:
+
+```ts
+export const DEFAULT_VIABILITY: ViabilityConfig = {
+  minSharedEvents: 3,   // minimum co-occurring events between any pair
+  minPeakShare: 0.6,    // minimum fraction of delays inside the peak window (edge sharpness)
+  minStrongEdges: 1,    // at least one sharp lagXCorr edge
+  minStructure: 2,      // non-trivial graph: siblings found OR ≥2 independent clusters
+};
+```
+
+The `ViabilityReport` returned in `result.viability` tells you exactly why the decision was made:
+
+```ts
+interface ViabilityReport {
+  viable: boolean;
+  channels: number;              // total channels in the data
+  maxSharedEvents: number;       // best pairwise co-occurrence
+  strongEdges: number;           // edges whose peakShare >= minPeakShare
+  multiChannelClusters: number;  // clusters with more than one member (siblings found)
+  clusterCount: number;          // total distinct author clusters
+  reason: string;                // human-readable explanation
+}
+```
+
+Override the viability thresholds by passing `viability` to `fit` or `predict`. All conditions must hold simultaneously — there is no partial credit.
+
+---
+
+## Training Labels — Path-Aware Replay
+
+The training label comes from an **exact replay of your production exit on 1m candles** (`replayExit`), not close-to-close. This is the most important property of the library: the optimizer sees the actual path the price took, not just two endpoints.
+
+<CardGroup cols={2}>
+  <Card title="moonbag / gravebag" icon="triangle-exclamation">
+    For a long (`moonbag`), the hard stop fires when the low of a 1m candle drops `hardStop %` below entry. For a short (`gravebag`), it fires when the high rises `hardStop %` above entry. Both are honest realized losses.
+  </Card>
+  <Card title="Trailing take" icon="chart-line">
+    Once `currentProfit >= 0`, the peak is tracked. When the close pulls back `trailingTake %` from the peak, the position exits at the peak PnL — not at the pullback close.
+  </Card>
+  <Card title="Peak staleness" icon="clock">
+    If the peak exceeds `stalenessSinceProfit %` profit but no new high is made for `stalenessSinceMinutes` minutes, the position exits at the stale peak. The price may never reach a classic TP target at all.
+  </Card>
+  <Card title="Life-cap" icon="stopwatch">
+    `staleMinutes` is the ceiling on position lifetime — the empirical impact horizon tuned by the grid. The position exits at the close of the last candle in the window, realizing whatever PnL (positive or negative) is there.
+  </Card>
+</CardGroup>
+
+**Why path-aware replay catches stop hunts:** a wick into the trap never reaches `trailingTake` because the pullback hits the hard stop. The label is negative even if `close[t+H]` happens to be positive. The optimizer sees the risk of stops directly in the training labels.
+
+An earlier version of the library rolled the realized PnL back to the last positive peak on a stop-out, which meant a stop-out never showed a loss and silently inflated PnL and risk-reward. This is now fixed — `hard-stop` always returns `-hardStop %` as the realized PnL.
+
+---
+
+## Look-Ahead Prevention
+
+The candle that *contains* the signal is still forming when the signal arrives. Its close, high, and low are only known at the end of that minute. Entering it would be peeking ahead into the future.
+
+The library avoids this with `entryStartTs`: the entry search starts at the **next fully-closed candle** after the signal. A signal that lands exactly on a candle boundary is tradeable (that candle is already closed) and is not skipped.
+
+```
+signal ts ─────────────────┐
+                           ▼
+  [...candle n closed] [candle n+1 forming] [candle n+2 closed] ...
+                                             ▲
+                                     entryStartTs = first candle to search
+```
+
+In `plan()` (live mode), `getCandles` is called for candles strictly before the signal — no look-ahead by construction. `backtest()` replays forward over already-closed history.
+
+<Note>
+  **`plan()` vs `backtest()`** — these two methods have different semantics:
+
+  - **`plan(items, source)`** is the live decision. It measures the cascade using candles *before* the signal (`squeezePressureBefore`), returns a `TradeSignal` (decision only — no result), and never requests a candle with `ts ≥ entryStartTs`.
+  - **`backtest(items, source)`** replays forward over closed history. It measures the cascade using candles *after* the entry, runs `replayExit` on the 1m path, and returns a `BacktestSignal` with a `result` that has realized PnL, exit reason, and entry/exit prices.
+
+  `signals()` uses neither — cascade is not evaluated and every verdict is `enter`.
+</Note>
+
+---
+
+## Stationarity Window
+
+On five months of data, statistics accumulate over incomparable regimes. Channels appear and go quiet, sibling pairs break up, and the author matrix built in January still remembers those connections in May.
+
+The fix is a local window: `selfTuneLag` and `clusterAuthors` are computed only over the most recent `stationarityWindowMs` of data ending at the latest event, not over the whole history. The window size is a grid axis tuned by cross-validation:
+
+```ts
+stationarityWindowMs: [
+  7  * 24 * 3600_000,  //  1 week
+  14 * 24 * 3600_000,  //  2 weeks
+  28 * 24 * 3600_000,  //  4 weeks
+  56 * 24 * 3600_000,  //  8 weeks
+]
+```
+
+`Infinity` (the default) uses the entire history. On a long horizon a finite window typically wins — it drops stale connections that no longer reflect the current regime. The stationarity window affects only matrix mode; single mode is independent of it.

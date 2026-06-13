@@ -1,0 +1,261 @@
+---
+title: "MetaLedger API: Cadence Guard and Family-Wise DSR Correction"
+sidebarTitle: "MetaLedger"
+description: "Reference for MetaLedger functions: emptyLedger, recordAttempt, canRefit, and effectiveTrials — the meta-overfitting guard for repeated training loops."
+---
+
+`MetaLedger` is a **serializable state record** that tracks every `PumpMatrix.fit()` attempt and enforces two invariants against meta-level overfitting — the kind that arises when `fit()` is called repeatedly inside an automated loop.
+
+The problem: DSR penalises the `N` configurations tried *within a single* `fit()`. But if the loop runs `fit()` 720 times per month and only promotes the model when `certified: true`, each "certified" run may itself be the lucky outlier among 720 attempts — a winner's curse at the meta level. A single-fit certificate is blind to the chain it was selected from.
+
+`MetaLedger` closes this gap with two mechanisms:
+
+1. **Cadence guard** — `canRefit()` refuses a new `fit()` that comes too soon after the last one. Frequent re-fitting is trial multiplication; the guard simply disallows it.
+2. **Family-wise correction** — when `metaLedger` is passed to `fit()`, the DSR's `nTrials` becomes `effectiveTrials` — the sum of inner grid sizes across **all** recorded fit attempts, not just the current one.
+
+---
+
+## `MetaLedgerState`
+
+The complete state is a plain, JSON-serializable object. Persist it between ticks (write to disk, a database, or environment state).
+
+```typescript
+interface MetaLedgerState {
+  /** ALL fit attempts — certified and uncertified alike */
+  attempts: Array<{
+    /** Unix timestamp when the fit was started (ms epoch) */
+    ts: number;
+    /** Number of grid configurations in this fit (inner trials) */
+    innerTrials: number;
+    /** Whether this fit was certified by its own (naïve, single-fit) criterion */
+    certifiedNaive: boolean;
+  }>;
+}
+```
+
+<ResponseField name="attempts" type="FitAttempt[]">
+  Ordered list of all fit attempts. Must include every attempt — logging only successes understates the effective trial count and makes the family-wise correction lie.
+</ResponseField>
+<ResponseField name="attempts[].ts" type="number">
+  Unix timestamp in milliseconds when the fit was launched.
+</ResponseField>
+<ResponseField name="attempts[].innerTrials" type="number">
+  Grid size of that fit — the number of configurations evaluated during model selection.
+</ResponseField>
+<ResponseField name="attempts[].certifiedNaive" type="boolean">
+  Whether `model.certification.certified` was `true` for that fit. Stored for audit; does not affect the cadence guard or trial count.
+</ResponseField>
+
+---
+
+## `emptyLedger`
+
+```typescript
+emptyLedger(): MetaLedgerState
+```
+
+Returns a fresh `MetaLedgerState` with an empty `attempts` array. Call this **once** when initialising the loop state; then pass the ledger forward on every tick.
+
+```typescript
+import { emptyLedger } from "pump-anomaly";
+
+let ledger = emptyLedger();
+// { attempts: [] }
+```
+
+<ResponseField name="returns" type="MetaLedgerState">
+  `{ attempts: [] }` — ready to be used as the initial loop state.
+</ResponseField>
+
+---
+
+## `canRefit`
+
+```typescript
+canRefit(
+  ledger: MetaLedgerState,
+  now: number,
+  policy?: { minRefitMs: number },
+): { allowed: boolean; reason: string; nextAllowedTs: number }
+```
+
+Checks whether a new `fit()` is permitted under the cadence policy. If the ledger is empty (first ever fit), it is always allowed. Otherwise, the function checks whether `now ≥ lastFitTs + minRefitMs`.
+
+The default `minRefitMs` is **7 days** (`7 × 24 × 3600 × 1000 ms`). This reflects the idea that a week of new market data is the minimum meaningful increment for retraining a pump-detection model; anything shorter is re-running the same data under a different random draw, which is just trial multiplication.
+
+<ParamField path="ledger" type="MetaLedgerState" required>
+  Current ledger state.
+</ParamField>
+<ParamField path="now" type="number" required>
+  Current Unix timestamp in milliseconds. Pass `Date.now()` in production.
+</ParamField>
+<ParamField path="policy.minRefitMs" type="number">
+  Minimum milliseconds between fits. Default: `604_800_000` (7 days).
+</ParamField>
+
+<ResponseField name="allowed" type="boolean">
+  `true` if a new fit is permitted right now.
+</ResponseField>
+<ResponseField name="reason" type="string">
+  Human-readable explanation. Examples:
+  - `"первый fit"` (first fit ever)
+  - `"интервал выдержан"` (interval satisfied)
+  - `"слишком частый refit: до следующего разрешённого 3.5ч. Частое переобучение размножает испытания (мета-winner's-curse)."` (too soon)
+</ResponseField>
+<ResponseField name="nextAllowedTs" type="number">
+  Unix timestamp in milliseconds when the next fit will be permitted. Equal to `lastFitTs + minRefitMs`, or `now` on the first fit.
+</ResponseField>
+
+```typescript
+import { canRefit } from "pump-anomaly";
+
+const gate = canRefit(ledger, Date.now());
+if (!gate.allowed) {
+  console.log(gate.reason);
+  console.log("Next allowed:", new Date(gate.nextAllowedTs).toISOString());
+  return;
+}
+// proceed to fit()
+```
+
+---
+
+## `recordAttempt`
+
+```typescript
+recordAttempt(
+  ledger: MetaLedgerState,
+  attempt: {
+    ts: number;
+    innerTrials: number;
+    certifiedNaive: boolean;
+  },
+): MetaLedgerState
+```
+
+Returns a **new** `MetaLedgerState` with the given attempt appended. The original ledger is not mutated (the function is pure).
+
+**You must call `recordAttempt` for every fit attempt — certified or not.** Recording only the successful fits understates the effective number of trials. The family-wise DSR correction only works because the denominator includes all attempts.
+
+<ParamField path="ledger" type="MetaLedgerState" required>
+  Current ledger state.
+</ParamField>
+<ParamField path="attempt.ts" type="number" required>
+  Unix timestamp of this fit (ms).
+</ParamField>
+<ParamField path="attempt.innerTrials" type="number" required>
+  Grid size — available as `model.innerTrials` after `fit()` returns.
+</ParamField>
+<ParamField path="attempt.certifiedNaive" type="boolean" required>
+  Whether this fit was individually certified — `model.certification.certified`.
+</ParamField>
+
+<ResponseField name="returns" type="MetaLedgerState">
+  New ledger with the attempt appended. Assign this back to your `ledger` variable.
+</ResponseField>
+
+---
+
+## `effectiveTrials`
+
+```typescript
+effectiveTrials(ledger: MetaLedgerState, currentInnerTrials: number): number
+```
+
+Returns the **total effective trial count** for the family-wise DSR correction:
+
+```
+effectiveTrials = Σ attempt.innerTrials  +  currentInnerTrials
+```
+
+This is the honest denominator for `deflatedSharpe`. If the loop has run `fit()` three times with grids of 500, 480, and 520 configurations, and the current fit used 500 configs, the effective trial count is `500 + 480 + 520 + 500 = 2000` — not 500.
+
+When you pass `metaLedger` to `fit()`, the library calls `effectiveTrials` internally and uses it as `nTrials` in `deflatedSharpe`. The result is exposed on the model as `model.effectiveTrials`.
+
+<ParamField path="ledger" type="MetaLedgerState" required>
+  Current ledger (before the current fit is recorded).
+</ParamField>
+<ParamField path="currentInnerTrials" type="number" required>
+  Grid size of the current fit (`model.innerTrials`).
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Total effective trials ≥ 1. Always at least `currentInnerTrials`.
+</ResponseField>
+
+---
+
+## `fitAttemptCount`
+
+```typescript
+fitAttemptCount(ledger: MetaLedgerState): number
+```
+
+Returns the number of fit attempts recorded in the ledger — `ledger.attempts.length`. Useful for reporting and for manual Bonferroni-style threshold adjustment.
+
+<ParamField path="ledger" type="MetaLedgerState" required>
+  Current ledger state.
+</ParamField>
+
+<ResponseField name="returns" type="number">
+  Total number of recorded fit attempts.
+</ResponseField>
+
+---
+
+## Full Usage Pattern
+
+The complete loop wires all four functions together. The ledger is the only mutable state; everything else is a pure transformation.
+
+```typescript
+import {
+  emptyLedger,
+  recordAttempt,
+  canRefit,
+  effectiveTrials,
+} from "pump-anomaly";
+import { PumpMatrix } from "pump-anomaly";
+
+// Initialize once; persist across ticks (write to disk / DB between runs)
+let ledger = emptyLedger();
+
+async function tick(history, getCandles) {
+  // 1. Cadence gate — refuse too-frequent refits
+  const gate = canRefit(ledger, Date.now());
+  if (!gate.allowed) {
+    console.log(gate.reason, "next allowed:", new Date(gate.nextAllowedTs));
+    return;
+  }
+
+  // 2. Train — pass the ledger so DSR uses effectiveTrials
+  const model = await PumpMatrix.fit(history, getCandles, { metaLedger: ledger });
+
+  // 3. Log EVERY attempt — certified or not
+  ledger = recordAttempt(ledger, {
+    ts: Date.now(),
+    innerTrials: model.innerTrials,
+    certifiedNaive: model.certification.certified,
+  });
+
+  // 4. Inspect meta-level counters
+  console.log(
+    "effectiveTrials:", model.effectiveTrials,
+    "fitAttempts:", model.fitAttempts,
+  );
+
+  // 5. Only deploy a certified model
+  if (model.certification.certified) {
+    // safe to use for live trading
+    const trades = await model.plan(latestSignals, getCandles);
+    for (const t of trades) {
+      openPosition(t.symbol, t.direction, t.exit);
+    }
+  } else {
+    console.log("Not certified:", model.certification.reasons);
+  }
+}
+```
+
+<Warning>
+Passing `metaLedger` to `fit()` is optional but strongly recommended for any automated training loop. Without it, the DSR only penalises configurations within the current fit's grid — it cannot see that this fit is itself one of many attempts from which you are selecting the certified outcome. The family-wise correction is only applied when the ledger is provided.
+</Warning>

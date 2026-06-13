@@ -1,0 +1,103 @@
+---
+title: "Backtest Crypto Pump Signals with Realized PnL Replay"
+sidebarTitle: "Backtesting"
+description: "Use model.backtest() to replay signals over closed historical candles and get realized PnL, entry/exit prices, and exit reasons for each trade."
+---
+
+`model.backtest()` replays your trained exit plan forward over already-closed 1 m candles and returns every signal annotated with a `BacktestResult` — the realized PnL, entry and exit prices, the exit reason, and the minutes held. Unlike `plan()`, which makes a live decision without knowing the future, `backtest()` has full access to the candles that follow the signal and simulates exactly what your production exit would have done. The same replay engine (`replayExit`) that labels the training data is used here, so the numbers you see are consistent with what training optimized for.
+
+## backtest() vs plan()
+
+The two methods share the same signal detection and exit resolution logic. They differ in exactly two ways:
+
+**1. Which candles they see.**
+`plan()` requests candles **before** the signal (`squeezePressureBefore`) — the cascade is measured from past price action only, with no look-ahead. This is the live-safe path.
+`backtest()` requests candles **after** the signal (forward `squeezePressure`) — it replays the full position life over already-closed history. This is only valid when reviewing the past.
+
+**2. What they return.**
+`plan()` returns `TradeSignal[]` — a decision. The position is not yet closed, so there is no realized PnL.
+`backtest()` returns `BacktestSignal[]` — each element is the same `TradeSignal` extended with a `result` field that holds the fully replayed outcome.
+
+## BacktestResult Fields
+
+```typescript
+interface BacktestResult {
+  entered: boolean;    // false if the entry zone was never touched on the candle window
+  pnl: number;         // realized PnL, fraction (0.05 = +5%; hard-stop = honest -hardStop%)
+  peak: number;        // peak PnL over the position's lifetime (diagnostic only)
+  reason: string;      // "hard-stop" | "trailing-take" | "peak-staleness" | "life-cap"
+  heldMinutes: number; // minutes from entry to exit
+  entryPrice: number;  // actual entry price (0 if not entered)
+  exitPrice: number;   // actual exit price (0 if not entered)
+  truncated: boolean;  // not enough candles after entry for the full life-cap window
+}
+```
+
+`entered: false` means the entry zone defined in the `ParserItem` (`entryFromPrice`/`entryToPrice`) was never touched by price on the available candle window — the trade would never have been opened. If no `ParserItem` entry zone is present, entry falls back to the open of the first candle.
+
+## Usage
+
+```typescript
+const results = await model.backtest(items, getCandles);
+
+for (const s of results) {
+  console.log(s.symbol, s.direction, s.result.pnl, s.result.reason);
+}
+```
+
+Like `plan()`, `backtest()` also accepts a preloaded `{ symbol: candles }` map for synchronous use:
+
+```typescript
+const results = model.backtest(items, { SOLUSDT: forwardCandles });
+```
+
+The async overload fetches `staleMinutes * 2 + 5` candles forward from `entryStartTs` for each signal. A broken symbol degrades to `result.entered = false` rather than crashing the call.
+
+## planForAt() for Single-Position Backtesting
+
+For a one-off backtest of a single position at a specific timestamp, use `planForAt()`:
+
+```typescript
+planForAt(
+  symbol: string,
+  direction: "long" | "short",
+  channel: string | null,
+  candles: ICandleData[],   // forward candles you supply
+  entryTs: number,          // the signal timestamp to replay from
+  policy?: Partial<SignalPolicy>,
+): BacktestSignal | null    // null if vetoed or action not in allow-list
+```
+
+`planForAt()` uses the forward `squeezePressure` (backtest-mode cascade) and returns a `BacktestSignal` with a fully replayed `result`. Entry zone is not specified — replay uses the open of the first candle, matching the training-time fallback behavior.
+
+## Honest PnL
+
+A stop-out realizes the honest `-hardStop%` — the actual result of the trade, not a softened version. Earlier versions of the library returned `lastPositivePeak` (≥ 0) on a stop, which meant a stop-out never showed a loss and silently inflated PnL and risk-reward statistics. That is fixed: if `reason` is `"hard-stop"`, `pnl` will be exactly `-hardStop / 100`.
+
+`peak` is kept separately in `BacktestResult` for diagnostics — it shows the highest intra-trade PnL before the stop hit, useful for understanding how far the trade moved in your favor before reversing. It is never used to compute the realized PnL.
+
+## PnL Statistics
+
+Aggregate realized-PnL statistics are baked into the model after training. The distribution is summarized with the median and percentiles so a single fat-tail trade does not define the system's edge:
+
+```typescript
+model.pnl.global;            // { mean, median, p5, p95, p99, n }
+model.pnl.bySymbol.SOLUSDT;  // { mean, median, p5, p95, p99, n }
+```
+
+`median` is the outlier-immune center. `p5` is the lower tail — the worst 5% of trades. `p95` / `p99` are the upper tails. Use `mean` for expectancy, `median` for a robust estimate of a typical trade, and `p5` to understand your left-tail exposure.
+
+## Risk-Reward Statistics
+
+Risk-reward per trade is `pnl / hardStop` — how many multiples of the risk amount were captured. These statistics are also baked into the model and available per symbol:
+
+```typescript
+model.riskReward.global;            // { mean, p95, p99, n }
+model.riskReward.bySymbol.SOLUSDT;  // { mean, p95, p99, n }
+```
+
+The per-symbol `riskReward` statistics are used by the runtime `minRiskReward` filter in `signals()` / `plan()` / `backtest()` — symbols whose backtested RR falls below the threshold are cut conservatively at the call site.
+
+<Note>
+  `replayExit` is the single replay engine used in three places: labeling the training data during `fit()`, computing `BacktestResult` in `backtest()` / `planForAt()`, and populating `dump()` records during training. The numbers are consistent across all three because they come from the same function with the same exit parameters.
+</Note>

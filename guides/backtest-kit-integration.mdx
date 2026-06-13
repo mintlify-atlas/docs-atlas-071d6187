@@ -1,0 +1,111 @@
+---
+title: "Integrate pump-anomaly with backtest-kit and ccxt"
+sidebarTitle: "backtest-kit"
+description: "Wire pump-anomaly's GetCandles interface to backtest-kit's Exchange.getRawCandles via a thin adapter, using ccxt as the exchange backend."
+---
+
+`PumpMatrix` needs exactly one thing from your data layer: a `getCandles` function that serves 1 m OHLCV candles by symbol, interval, and date range. [`backtest-kit`](https://www.npmjs.com/package/backtest-kit) already provides that contract through `Exchange.getRawCandles`, whose argument order matches `GetCandles` one-to-one. The adapter is a one-liner: register an exchange schema once with your ccxt instance, then wire `Exchange.getRawCandles` as the candle source for all three phases — training, live, and backtesting.
+
+## The Adapter Pattern
+
+The complete integration from the README — register the exchange schema once, then reuse the same `getCandles` adapter everywhere:
+
+```typescript
+import { addExchangeSchema, Exchange } from "backtest-kit";
+import { singleshot } from "functools-kit";
+import * as pump from "pump-anomaly";
+import ccxt from "ccxt";
+
+// Lazy singleton — loadMarkets() is called once and reused
+const getExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    enableRateLimit: true,
+    options: { defaultType: "spot" },
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+// Register the exchange schema once. getCandles here is backtest-kit's OHLCV fetch;
+// formatPrice, formatQuantity, getOrderBook, getAggregatedTrades omitted for brevity.
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = await getExchange();
+    const rows = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return rows.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  // ...formatPrice, formatQuantity, etc.
+});
+
+// Adapter: backtest-kit's getRawCandles → pump-anomaly's GetCandles
+// Argument order matches one-to-one — no transformation needed.
+const getCandles = (symbol, interval, limit, sDate, eDate) =>
+  Exchange.getRawCandles(symbol, interval, { exchangeName: "ccxt-exchange" }, limit, sDate, eDate);
+```
+
+`getCandles` is now a standard `pump-anomaly` `GetCandles` function backed by your registered exchange schema. Pass it to `fit`, `plan`, and `backtest` as-is.
+
+## Three Phases with One Adapter
+
+The same `getCandles` adapter serves all three phases of the pump-anomaly lifecycle:
+
+```typescript
+import signals from "./assets/parser-items.json" with { type: "json" };
+import weights from "./assets/model-weights.json" with { type: "json" };
+
+// 1) TRAIN — labels are set by replaying your prod exit on 1m candles forward
+async function trainWeights() {
+  const model = await pump.PumpMatrix.fit(signals, getCandles);
+  return model.save(); // → write to assets/model-weights.json
+}
+
+// 2) LIVE — load weights (no retraining), get ready-to-execute signals
+async function planLive() {
+  const model = pump.PumpMatrix.load(weights);
+  return model.plan(signals, getCandles); // TradeSignal[] — direction/entry/exit ready
+}
+
+// 3) BACKTEST — same weights, replay forward, realized PnL in result
+async function runBacktest() {
+  const model = pump.PumpMatrix.load(weights);
+  return model.backtest(signals, getCandles); // BacktestSignal[] — each has result.pnl
+}
+```
+
+What `getCandles` fetches in each phase is different:
+
+- **`fit`** — pulls 1 m candles **forward** from each signal event to label it via exit replay. This is the most data-intensive phase.
+- **`plan`** — pulls 1 m candles **strictly before** the signal (look-ahead-free) to evaluate the liquidation-cascade detector.
+- **`backtest`** — pulls 1 m candles **after** the signal for forward replay of the exit plan.
+
+The adapter is unaware of which phase is calling it; the direction of the window is handled entirely inside `pump-anomaly`.
+
+## Composing with Other Anomaly Libraries
+
+The same `Exchange` schema registered above is consumed independently by other libraries in the same ecosystem:
+
+- [`volume-anomaly`](https://www.npmjs.com/package/volume-anomaly) — consumes `Exchange.getAggregatedTrades` for entry timing based on large-order flow.
+- [`garch`](https://www.npmjs.com/package/garch) — consumes `Exchange.getCandles` for volatility-sized TP/SL.
+
+`pump-anomaly` answers *which post to trade and how to exit it*. The other libraries plug into the same schema independently, without touching each other. Register the schema once and all three consume it.
+
+## GetCandles Range Semantics
+
+`GetCandles` supports five calling patterns, all of which `Exchange.getRawCandles` implements:
+
+| Call signature | Returns |
+|---|---|
+| `getCandles(symbol, interval, limit)` | Last `limit` candles aligned to now |
+| `getCandles(symbol, interval, limit, sDate)` | `limit` candles starting from `sDate` |
+| `getCandles(symbol, interval, limit, undefined, eDate)` | `limit` candles ending at `eDate` |
+| `getCandles(symbol, interval, undefined, sDate, eDate)` | All candles in `[sDate, eDate)` |
+| `getCandles(symbol, interval, limit, sDate, eDate)` | Exactly `limit` candles from `sDate` |
+
+`sDate` is inclusive; `eDate` is exclusive. Timestamps are aligned to the candle boundary of the requested interval before fetching. Training internally uses `fetchCandlesChunked` to paginate requests that would exceed your adapter's chunk limit (500 candles), so your `getCandles` implementation does not need to handle pagination itself — just implement the basic fetch and return what the exchange gives you.
+
+<Note>
+  `assets/parser-items.json` is your channel history as a `ParserItem[]` array — the raw Telegram signal records your parser produced. `assets/model-weights.json` is the output of `model.save()` — the serialized `TrainedParams` JSON that `PumpMatrix.load()` accepts. Both are plain JSON files and can be read with a standard `import … with { type: "json" }` or `JSON.parse(fs.readFileSync(…))`.
+</Note>
